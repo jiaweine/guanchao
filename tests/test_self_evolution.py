@@ -1,3 +1,8 @@
+import time
+
+from fastapi.testclient import TestClient
+
+from guanchao.api import create_app
 from guanchao.harness import AgentHarness
 from guanchao.policy import OwnedPolicy, PolicyProfile
 from guanchao.store import Store
@@ -49,6 +54,15 @@ def _ready_state() -> dict:
             {"key": "authentic_variation", "direction": "against"},
         ],
     }
+
+
+def _wait_api_run(client: TestClient, run_id: str) -> dict:
+    for _ in range(200):
+        run = client.get(f"/api/runs/{run_id}").json()
+        if run["status"] != "running":
+            return run
+        time.sleep(.01)
+    raise AssertionError("run did not finish")
 
 
 def test_contextual_preference_learning_can_promote_early_verdict():
@@ -103,30 +117,48 @@ def test_harness_replays_its_own_completed_trajectory(tmp_path):
     )
 
 
-def test_human_review_is_delayed_feedback_for_harness(tmp_path):
-    store = Store(str(tmp_path / "review-learning.sqlite"))
-    harness = AgentHarness(store)
-    case = store.create_case("人工反馈", "调查营销倾向并给出证据", [_account("review-run")])
-    run_id = harness.start(case["id"], case["goal"])
-    harness.wait(run_id, 10)
-    harness.wait_learning(10)
-    run = store.get_run(run_id)
+def test_review_api_triggers_harness_delayed_feedback(tmp_path):
+    app = create_app(str(tmp_path / "review-api.sqlite"))
+    client = TestClient(app)
+    case = client.post(
+        "/api/cases",
+        json={
+            "title": "人工反馈",
+            "goal": "调查营销倾向并给出证据",
+            "targets": [_account("review-run")],
+        },
+    ).json()
+    run_id = client.post(
+        f"/api/cases/{case['id']}/messages",
+        json={"content": case["goal"]},
+    ).json()["run_id"]
+    run = _wait_api_run(client, run_id)
+    app.state.harness.wait_learning(10)
+
     result = run["state"]["primary_result"]
-    threshold = store.get_calibration().decision_threshold
+    threshold = app.state.store.get_calibration().decision_threshold
     decision = (
         "confirm_marketing"
         if float(result["marketing_likelihood"]) >= threshold
         else "confirm_ordinary"
     )
-    store.add_review(case["id"], run_id, decision)
+    before = app.state.store.get_policy_profile().reviews
+    response = client.post(
+        "/api/reviews",
+        json={
+            "case_id": case["id"],
+            "run_id": run_id,
+            "decision": decision,
+            "reason": "人工核对完成",
+            "note": "用于 Harness 延迟反馈回归",
+        },
+    )
+    assert response.status_code == 200
+    app.state.harness.wait_learning(10)
 
-    before = store.get_policy_profile().reviews
-    harness.observe_review(run_id, decision)
-    harness.wait_learning(10)
-    after = store.get_policy_profile().reviews
-
+    after = app.state.store.get_policy_profile().reviews
     assert after == before + 1
     assert any(
         item["event_type"] == "harness_self_evolved"
-        for item in store.audit_events(limit=100)
+        for item in app.state.store.audit_events(limit=100)
     )
