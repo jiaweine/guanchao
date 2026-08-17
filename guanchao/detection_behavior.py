@@ -5,10 +5,17 @@ import statistics
 from datetime import datetime
 from itertools import combinations
 
-from .domain import Evidence, FeatureVector, PostSnapshot
+from .domain import AccountSnapshot, Evidence, FeatureVector, PostSnapshot
 from .detection_support import (
-    _AUTHENTIC_RE, _COMMERCIAL_RE, _CONTACT_RE, _CTA_RE, _DISCLOSURE_RE, _PRICE_RE,
-    _clamp, _clip_range, _shingles, _tokens,
+    _AUTHENTIC_RE,
+    _COMMERCIAL_RE,
+    _CONTACT_RE,
+    _CTA_RE,
+    _DISCLOSURE_RE,
+    _PRICE_RE,
+    _clamp,
+    _shingles,
+    _tokens,
 )
 from .semantic import SemanticSignal
 
@@ -25,8 +32,8 @@ class DetectionBehaviorMixin:
             "call_to_action": ("行动引导明显", "内容频繁引导下单、关注、评论、进入店铺或领取优惠。"),
             "contact_pressure": ("导流线索集中", "资料中多次出现私信、联系方式、进群或商务导流。"),
             "template_reuse": ("内容结构重复", "多条内容在结构和措辞上高度接近，存在批量化生产特征。"),
-            "cadence_burst": ("发布节奏偏批量", "发布时间呈现集中发布或近似固定批次节奏。"),
-            "engagement_pattern": ("互动形态过于整齐", "不同内容的互动比例异常接近，或深度互动长期偏低。"),
+            "cadence_burst": ("发布节奏呈现规律", "发布时间呈现集中或近似固定的重复节奏。"),
+            "engagement_pattern": ("互动形态较整齐", "不同内容的互动比例相近，深度互动相对有限。"),
             "profile_commerciality": ("主页长期经营线索清晰", "简介中存在经营、合作、客服、门店或导流信息。"),
             "cross_post_pressure": ("跨内容转化压力持续", "多条内容持续叠加链接、价格或固定转化句式。"),
             "disclosure_signal": ("存在合作披露", "内容中出现广告、赞助或品牌合作等披露。"),
@@ -34,24 +41,35 @@ class DetectionBehaviorMixin:
             "media_commerciality": ("素材里出现商业线索", "图片、视频或音频解析结果中出现价格、品牌或转化信息。"),
             "identity_consistency": ("主页与内容长期一致", "主页定位和近期内容中的商业目的持续一致。"),
         }
-        items = sorted(
-            ((k, getattr(features, k), w) for k, w in self.calibration.weights.items()),
-            key=lambda x: abs(x[1] * x[2]),
+        ranked = sorted(
+            (
+                (key, float(getattr(features, key)), weight)
+                for key, weight in self.calibration.weights.items()
+                if key in titles
+            ),
+            key=lambda row: abs(row[1] * row[2]),
             reverse=True,
         )
         evidence: list[Evidence] = []
-        for key, value, weight in items[:8]:
-            if value < 0.16:
+        for key, value, weight in ranked:
+            contribution = abs(value * weight)
+            if contribution <= 0.0:
                 continue
             title, detail = titles[key]
-            direction = "against" if weight < 0 else ("context" if key == "disclosure_signal" else "supports")
+            direction = (
+                "against"
+                if weight < 0
+                else "context"
+                if key == "disclosure_signal"
+                else "supports"
+            )
             ids = semantic.post_ids.get(key) or self._example_posts(posts, key)
             evidence.append(
                 Evidence(
                     key,
                     title,
                     detail,
-                    _clamp(abs(value * weight) / 1.25),
+                    contribution / (1.0 + contribution),
                     direction,
                     ids,
                     [],
@@ -67,52 +85,46 @@ class DetectionBehaviorMixin:
         marketing: float,
         semantic_grounded: float,
     ) -> float:
-        posts = [p for p in account.posts if p.text.strip()]
+        posts = [post for post in account.posts if post.text.strip()]
         n = len(posts)
-        sample = 1.0 - math.exp(-n / 4.0) if n else 0.0
+        sample_support = n / (n + 1.0) if n else 0.0
         channels = [
             bool(account.bio),
-            any(p.published_at for p in posts),
-            any(p.views or p.likes or p.comments or p.shares for p in posts),
+            any(post.published_at for post in posts),
+            any(post.views or post.likes or post.comments or post.shares for post in posts),
             bool(account.followers),
             features.media_commerciality > 0,
             semantic_grounded > 0,
         ]
-        metadata = sum(channels) / len(channels)
-        margin = min(1.0, abs(marketing - 0.5) * 2.0)
-        evidence_certainty = 1.0 - math.exp(-(0.8 + n / 4.0) * margin * margin)
-        base = 0.10 + 0.46 * sample + 0.17 * metadata + 0.27 * evidence_certainty
-        return _clamp(base * (0.70 + 0.30 * stability))
-
-    @staticmethod
-    def _swing_limit(sample_size: int) -> float:
-        # With more observations, a single post should have less leverage.
-        return _clip_range(0.34 / math.sqrt(max(1.0, sample_size / 2.0)), 0.12, 0.28)
+        metadata_support = sum(channels) / len(channels)
+        threshold = self.calibration.decision_threshold
+        span = max(threshold, 1.0 - threshold, 1e-6)
+        separation = min(1.0, abs(marketing - threshold) / span)
+        components = [sample_support, metadata_support, separation, stability]
+        if any(component <= 0.0 for component in components):
+            return 0.0
+        return _clamp(math.prod(components) ** (1.0 / len(components)))
 
     def _label(self, score: float, confidence: float, stability: float) -> str:
-        uncertainty = max(1.0 - confidence, 1.0 - stability)
-        abstain = _clip_range(
-            self.calibration.abstain_margin * (1.0 + uncertainty),
-            self.calibration.abstain_margin,
-            0.22,
-        )
         threshold = self.calibration.decision_threshold
-        if confidence < 0.42:
-            return "证据不足"
+        maximum_band = max(0.0, min(threshold, 1.0 - threshold))
+        base_band = min(maximum_band, max(0.0, self.calibration.abstain_margin))
+        uncertainty = max(1.0 - confidence, 1.0 - stability)
+        abstain = base_band + uncertainty * (maximum_band - base_band)
         if threshold - abstain <= score <= threshold + abstain:
             return "存在部分营销信号"
-        if score >= self.calibration.high_threshold and confidence >= 0.66:
+        if score >= self.calibration.high_threshold:
             return "高度营销化"
         if score > threshold + abstain:
             return "明显营销倾向"
         return "更像普通创作者"
 
     @staticmethod
-    def _summary(label: str, confidence: float, evidence: list[Evidence], missing: list[str]) -> str:
-        if label == "证据不足":
-            return "当前资料还不足以稳定判断。建议补充近期内容或可核对的素材后再复核。"
-        support = [e.title for e in evidence if e.direction == "supports"][:2]
-        against = [e.title for e in evidence if e.direction == "against"][:1]
+    def _summary(
+        label: str, confidence: float, evidence: list[Evidence], missing: list[str]
+    ) -> str:
+        support = [item.title for item in evidence if item.direction == "supports"][:2]
+        against = [item.title for item in evidence if item.direction == "against"][:1]
         parts = [f"当前判断为“{label}”，把握度约 {round(confidence * 100)}%。"]
         if support:
             parts.append("主要依据是" + "、".join(support) + "。")
@@ -125,21 +137,27 @@ class DetectionBehaviorMixin:
     def _template_reuse(self, posts: list[PostSnapshot]) -> float:
         if len(posts) < 2:
             return 0.0
-        vectors = [_shingles(p.text) for p in posts[:20]]
-        sims = [len(a & b) / max(1, len(a | b)) for a, b in combinations(vectors, 2) if a and b]
-        if not sims:
-            return 0.0
-        top = sorted(sims, reverse=True)[: max(1, min(8, len(sims)))]
-        return _clamp(statistics.fmean(top) * 1.8)
+        vectors = [_shingles(post.text) for post in posts[:20]]
+        similarities = [
+            len(first & second) / max(1, len(first | second))
+            for first, second in combinations(vectors, 2)
+            if first and second
+        ]
+        return _clamp(statistics.fmean(similarities)) if similarities else 0.0
 
     def _lexical_variation(self, texts: list[str]) -> float:
-        if len(texts) < 2:
-            return 0.2 if texts else 0.0
-        token_sets = [set(_tokens(t)) for t in texts]
-        unique = [len(s) / max(1, len(_tokens(t))) for s, t in zip(token_sets, texts)]
-        lengths = [len(t) for t in texts]
-        cv = statistics.pstdev(lengths) / max(1.0, statistics.fmean(lengths))
-        return _clamp(0.55 * statistics.fmean(unique) + 0.45 * min(1.0, cv * 1.8))
+        if not texts:
+            return 0.0
+        if len(texts) == 1:
+            tokens = _tokens(texts[0])
+            return len(set(tokens)) / max(1, len(tokens))
+        token_sets = [set(_tokens(text)) for text in texts]
+        similarities = [
+            len(first & second) / max(1, len(first | second))
+            for first, second in combinations(token_sets, 2)
+            if first or second
+        ]
+        return _clamp(1.0 - statistics.fmean(similarities)) if similarities else 0.0
 
     def _cadence_burst(self, posts: list[PostSnapshot]) -> float:
         times: list[datetime] = []
@@ -153,26 +171,36 @@ class DetectionBehaviorMixin:
         if len(times) < 3:
             return 0.0
         times.sort()
-        intervals = [(b - a).total_seconds() / 3600 for a, b in zip(times, times[1:])]
+        intervals = [
+            (right - left).total_seconds()
+            for left, right in zip(times, times[1:])
+            if (right - left).total_seconds() >= 0
+        ]
+        if not intervals:
+            return 0.0
         mean = statistics.fmean(intervals)
         if mean <= 0:
             return 1.0
         cv = statistics.pstdev(intervals) / mean if len(intervals) > 1 else 0.0
-        short_share = sum(1 for x in intervals if x <= 2.0) / len(intervals)
-        return _clamp(0.58 * short_share + 0.42 * (1.0 - min(1.0, cv)))
+        return 1.0 / (1.0 + cv)
 
     def _engagement_pattern(self, posts: list[PostSnapshot]) -> float:
-        with_views = [p for p in posts if p.views > 0]
-        if len(with_views) >= 3:
-            ratios = [(p.likes + 2 * p.comments + 2 * p.shares) / p.views for p in with_views]
-            mean = statistics.fmean(ratios)
-            cv = statistics.pstdev(ratios) / max(0.0001, mean)
-            shallow = statistics.fmean([p.comments / max(1, p.likes) for p in with_views])
-            return _clamp(
-                0.58 * _clamp((0.18 - min(0.18, cv)) / 0.18)
-                + 0.42 * _clamp((0.035 - min(0.035, shallow)) / 0.035)
-            )
-        return 0.0
+        with_views = [post for post in posts if post.views > 0]
+        if len(with_views) < 2:
+            return 0.0
+        ratios = [
+            (post.likes + post.comments + post.shares) / post.views
+            for post in with_views
+        ]
+        mean = statistics.fmean(ratios)
+        cv = statistics.pstdev(ratios) / max(mean, 1e-9)
+        regularity = 1.0 / (1.0 + cv)
+        depth = statistics.fmean(
+            (post.comments + post.shares) / max(1, post.likes + post.comments + post.shares)
+            for post in with_views
+        )
+        shallowness = 1.0 - _clamp(depth)
+        return _clamp(math.sqrt(regularity * shallowness))
 
     @staticmethod
     def _example_posts(posts: list[PostSnapshot], key: str) -> list[str]:
@@ -185,10 +213,10 @@ class DetectionBehaviorMixin:
             "authentic_variation": _AUTHENTIC_RE,
         }
         if key == "template_reuse":
-            return [p.id for p in posts[:3]]
+            return [post.id for post in posts[:3]]
         pattern = patterns.get(key)
         return (
-            [p.id for p in posts if pattern and pattern.search(p.text)][:3]
+            [post.id for post in posts if pattern and pattern.search(post.text)][:3]
             if pattern
-            else [p.id for p in posts[:2]]
+            else [post.id for post in posts[:2]]
         )
