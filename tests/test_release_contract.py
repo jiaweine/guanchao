@@ -1,3 +1,4 @@
+import struct
 import time
 from pathlib import Path
 
@@ -28,6 +29,13 @@ def _wait_run(client: TestClient, run_id: str) -> dict:
     raise AssertionError("run did not finish")
 
 
+def _png_dimensions(path: Path) -> tuple[int, int]:
+    data = path.read_bytes()
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    assert data[12:16] == b"IHDR"
+    return struct.unpack(">II", data[16:24])
+
+
 def test_list_and_review_queue_use_compact_summaries(tmp_path):
     client = TestClient(create_app(str(tmp_path / "db.sqlite")))
     case = client.post(
@@ -40,12 +48,20 @@ def test_list_and_review_queue_use_compact_summaries(tmp_path):
     run = _wait_run(client, run_id)
     assert run["status"] == "completed"
 
-    listed = next(item for item in client.get("/api/cases?status=all").json() if item["id"] == case["id"])
+    listed = next(
+        item
+        for item in client.get("/api/cases?status=all").json()
+        if item["id"] == case["id"]
+    )
     assert "posts" not in listed["targets"][0]
     assert "features" not in (listed["latest_result"] or {})
     assert "evidence" not in (listed["latest_result"] or {})
 
-    queued = next(item for item in client.get("/api/review-queue?reviewed=false").json() if item["case_id"] == case["id"])
+    queued = next(
+        item
+        for item in client.get("/api/review-queue?reviewed=false").json()
+        if item["case_id"] == case["id"]
+    )
     assert "posts" not in queued["targets"][0]
     assert "features" not in queued["result"]
     assert "evidence" not in queued["result"]
@@ -55,7 +71,7 @@ def test_list_and_review_queue_use_compact_summaries(tmp_path):
     assert detail["runs"][0]["state"]["primary_result"]["features"]
 
 
-def test_readme_presents_png_renders_and_keeps_vector_sources():
+def test_readme_images_are_retina_resolution_and_math_is_github_safe():
     text = Path("README.md").read_text(encoding="utf-8")
     png_images = [
         "docs/product-preview.png",
@@ -69,16 +85,21 @@ def test_readme_presents_png_renders_and_keeps_vector_sources():
         "docs/product-review-queue.svg",
         "docs/product-evidence.svg",
     ]
+
     for image in png_images:
         assert image in text
         path = Path(image)
         assert path.is_file()
-        assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        width, height = _png_dimensions(path)
+        assert width >= 2400
+        assert height >= 1400
+
     for source in svg_sources:
-        assert source in text
         assert Path(source).is_file()
-    for markdown_image in [line for line in text.splitlines() if line.startswith("![")]:
-        assert ".svg)" not in markdown_image
+
+    assert "\\operatorname" not in text
+    assert "\\mathrm{clip}" in text
+    assert "\\mathrm{StdDev}" in text
 
     for formula_token in [
         "P_{\\mathrm{mkt}}",
@@ -89,5 +110,6 @@ def test_readme_presents_png_renders_and_keeps_vector_sources():
         "-0.015",
     ]:
         assert formula_token in text
+
     for flow_token in ["▼", "→", "├─", "└─"]:
         assert flow_token not in text
