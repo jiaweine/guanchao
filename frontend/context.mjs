@@ -24,9 +24,7 @@ export function createDraftRegistry(limit = 50) {
     const draft = cleanDraft(value);
     drafts.delete(caseId);
     if (hasDraft(draft)) drafts.set(caseId, draft);
-    while (drafts.size > Math.max(1, Number(limit) || 50)) {
-      drafts.delete(drafts.keys().next().value);
-    }
+    while (drafts.size > Math.max(1, Number(limit) || 50)) drafts.delete(drafts.keys().next().value);
   };
 
   return {
@@ -39,8 +37,7 @@ export function createDraftRegistry(limit = 50) {
       return cleanDraft(currentCaseId ? drafts.get(currentCaseId) || EMPTY_DRAFT : EMPTY_DRAFT);
     },
     update(caseId, value) {
-      if (!caseId) return;
-      store(caseId, value);
+      if (caseId) store(caseId, value);
     },
     consume(caseId, field) {
       if (!caseId || !['message', 'note'].includes(field)) return;
@@ -103,13 +100,19 @@ export function guardCaseBoundBlob(response, requestCaseId, getSelectedCaseId) {
     configurable: true,
     value: async () => {
       const blob = await originalBlob();
-      if (getSelectedCaseId() !== requestCaseId) {
-        throw new Error('已切换到另一调查，原调查报告未下载。');
-      }
+      if (getSelectedCaseId() !== requestCaseId) throw new Error('已切换到另一调查，原调查报告未下载。');
       return blob;
     },
   });
   return response;
+}
+
+export function submittedDraftField(meta, response) {
+  const applied = response?.ok || response?.headers?.get?.('X-Guanchao-Write-Applied') === '1';
+  if (!applied || meta.method !== 'POST') return '';
+  if (/^\/api\/cases\/[^/]+\/messages$/.test(meta.url.pathname)) return 'message';
+  if (/^\/api\/cases\/[^/]+\/comments$/.test(meta.url.pathname)) return 'note';
+  return '';
 }
 
 function visibleModal(documentRef) {
@@ -139,13 +142,6 @@ function isCaseDelete(meta) {
 
 function isCaseReport(meta) {
   return meta.method === 'GET' && /^\/api\/cases\/[^/]+\/report$/.test(meta.url.pathname);
-}
-
-function successfulDraftField(meta, response) {
-  if (!response.ok || meta.method !== 'POST') return '';
-  if (/^\/api\/cases\/[^/]+\/messages$/.test(meta.url.pathname)) return 'message';
-  if (/^\/api\/cases\/[^/]+\/comments$/.test(meta.url.pathname)) return 'note';
-  return '';
 }
 
 export function installCaseContextGuards({ windowRef = window, documentRef = document } = {}) {
@@ -183,7 +179,7 @@ export function installCaseContextGuards({ windowRef = window, documentRef = doc
     const meta = requestMeta(input, init, windowRef.location.href);
     const response = await downstreamFetch(input, init);
     const requestCaseId = caseIdFromRequest(meta);
-    const consumedField = successfulDraftField(meta, response);
+    const consumedField = submittedDraftField(meta, response);
     if (consumedField && requestCaseId) registry.consume(requestCaseId, consumedField);
 
     if (isCaseDetailRequest(meta) && response.ok) {
@@ -192,17 +188,13 @@ export function installCaseContextGuards({ windowRef = window, documentRef = doc
         const restored = registry.select(snapshot.id, draftFromDocument(documentRef));
         applyDraft(documentRef, restored);
       }
-    } else if (isCaseDelete(meta) && response.ok) {
-      if (requestCaseId) {
-        const wasCurrent = registry.current() === requestCaseId;
-        registry.clear(requestCaseId);
-        if (wasCurrent) applyDraft(documentRef, EMPTY_DRAFT);
-      }
+    } else if (isCaseDelete(meta) && response.ok && requestCaseId) {
+      const wasCurrent = registry.current() === requestCaseId;
+      registry.clear(requestCaseId);
+      if (wasCurrent) applyDraft(documentRef, EMPTY_DRAFT);
     }
 
-    if (isCaseReport(meta) && response.ok) {
-      return guardCaseBoundBlob(response, requestCaseId, () => registry.current());
-    }
+    if (isCaseReport(meta) && response.ok) return guardCaseBoundBlob(response, requestCaseId, () => registry.current());
     return response;
   };
 

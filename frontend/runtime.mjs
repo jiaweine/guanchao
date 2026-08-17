@@ -83,7 +83,13 @@ function jsonResponse(data, status = 200) {
 }
 
 function staleWriteResponse(caseId) {
-  return jsonResponse({ detail: `操作已应用到原调查 ${caseId}；你已切换到另一调查，页面没有采用旧响应。` }, 409);
+  return new Response(
+    JSON.stringify({ detail: `操作已应用到原调查 ${caseId}；你已切换到另一调查，页面没有采用旧响应。` }),
+    {
+      status: 409,
+      headers: { ...JSON_HEADERS, 'X-Guanchao-Write-Applied': '1' },
+    },
+  );
 }
 
 function restoreDraft(documentRef, content) {

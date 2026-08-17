@@ -136,7 +136,6 @@ export function installCreationGuards({ windowRef = window, documentRef = docume
   windowRef.fetch = createCreationFetch({
     downstreamFetch,
     getHref: () => windowRef.location.href,
-    documentRef,
     onRecover: (caseId, detail) => {
       notify(documentRef, detail);
       setTimeout(() => {
