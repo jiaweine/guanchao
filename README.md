@@ -142,7 +142,7 @@ Runtime 会自主推进：
 ### 1. 安装
 
 ```bash
-git clone --branch guanchao --single-branch https://github.com/jiaweine/mojing-studio.git guanchao
+git clone https://github.com/jiaweine/guanchao.git
 cd guanchao
 
 python -m venv .venv
