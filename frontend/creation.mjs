@@ -1,4 +1,4 @@
-import { caseIdFromRequest, isCaseDetailRequest, requestMeta } from './runtime.mjs';
+import { caseIdFromRequest, requestMeta } from './runtime.mjs';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
 
@@ -22,6 +22,10 @@ function messageSignature(meta) {
     : '';
 }
 
+function messageCaseId(meta) {
+  return messageSignature(meta) ? caseIdFromRequest(meta) : null;
+}
+
 function conflictResponse(detail) {
   return new Response(JSON.stringify({ detail }), { status: 409, headers: JSON_HEADERS });
 }
@@ -38,9 +42,24 @@ export function createCreationFetch({ downstreamFetch, getHref, onRecover = () =
     onRecover(caseId, detail);
   };
 
+  const finishTransition = () => {
+    createdCaseId = null;
+    messageFlights.clear();
+  };
+
   return async function creationFetch(input, init = {}) {
     const meta = requestMeta(input, init, getHref());
     const creatingCase = meta.method === 'POST' && meta.url.pathname === '/api/cases';
+    const targetMessageCaseId = messageCaseId(meta);
+
+    if (createdCaseId && targetMessageCaseId && targetMessageCaseId !== createdCaseId) {
+      const interruptedCaseId = createdCaseId;
+      const detail = '新调查已经创建，但你在首次核查开始前切换到了另一调查；正在打开新调查，避免把核查目标写入错误账号。';
+      recover(interruptedCaseId, detail);
+      finishTransition();
+      return conflictResponse(detail);
+    }
+
     const transitionWrite = isCreatedCaseWrite(meta, createdCaseId);
     const signature = transitionWrite ? messageSignature(meta) : '';
     const effectiveInit = transitionWrite ? withCaseTransition(init, createdCaseId) : init;
@@ -60,8 +79,10 @@ export function createCreationFetch({ downstreamFetch, getHref, onRecover = () =
       }
     } catch (error) {
       if (transitionWrite && signature && createdCaseId) {
+        const interruptedCaseId = createdCaseId;
         const detail = '调查已创建，但核查未启动；正在打开已创建调查，请重新发起核查。';
-        recover(createdCaseId, detail);
+        recover(interruptedCaseId, detail);
+        finishTransition();
         throw new Error(detail);
       }
       throw error;
@@ -72,20 +93,18 @@ export function createCreationFetch({ downstreamFetch, getHref, onRecover = () =
       if (created?.id) createdCaseId = created.id;
     }
 
-    if (transitionWrite && signature && !response.ok && createdCaseId) {
-      const payload = await response.clone().json().catch(() => ({}));
-      const detail = payload.detail || '调查已创建，但核查未启动；正在打开已创建调查，请重新发起核查。';
-      recover(createdCaseId, detail);
-      return conflictResponse(detail);
+    if (transitionWrite && signature && createdCaseId) {
+      if (!response.ok) {
+        const interruptedCaseId = createdCaseId;
+        const payload = await response.clone().json().catch(() => ({}));
+        const detail = payload.detail || '调查已创建，但核查未启动；正在打开已创建调查，请重新发起核查。';
+        recover(interruptedCaseId, detail);
+        finishTransition();
+        return conflictResponse(detail);
+      }
+      finishTransition();
     }
 
-    if (isCaseDetailRequest(meta) && response.ok && createdCaseId) {
-      const snapshot = await response.clone().json().catch(() => ({}));
-      if (snapshot?.id === createdCaseId) {
-        createdCaseId = null;
-        messageFlights.clear();
-      }
-    }
     return response;
   };
 }
