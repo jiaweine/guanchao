@@ -1,7 +1,8 @@
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from pathlib import Path
 from threading import Event
 
+import httpx
 from fastapi.testclient import TestClient
 
 import guanchao.api as api_module
@@ -139,8 +140,8 @@ def test_case_mutation_lock_prevents_asset_and_run_start_from_crossing_snapshots
     asset_dir = tmp_path / 'assets'
     monkeypatch.setenv('GUANCHAO_ASSET_DIR', str(asset_dir))
     app = create_app(str(tmp_path / 'db.sqlite'))
-    client = TestClient(app)
-    case = _case(client)
+    setup_client = TestClient(app)
+    case = _case(setup_client)
 
     run_entered = Event()
     release_run = Event()
@@ -159,20 +160,27 @@ def test_case_mutation_lock_prevents_asset_and_run_start_from_crossing_snapshots
     monkeypatch.setattr(app.state.harness, 'start', slow_start)
     monkeypatch.setattr(app.state.store, 'create_asset', observed_create_asset)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        run_future = executor.submit(
-            client.post,
-            f"/api/cases/{case['id']}/messages",
-            json={'content': '开始核查'},
-        )
-        assert run_entered.wait(1), 'run request did not enter harness'
-        asset_future = executor.submit(
-            client.post,
-            f"/api/cases/{case['id']}/assets",
-            files={'file': ('serialized.txt', b'evidence', 'text/plain')},
-        )
-        assert not asset_entered.wait(0.12), 'asset mutation crossed an in-flight run start'
-        release_run.set()
-        assert run_future.result(timeout=2).status_code == 200
-        assert asset_future.result(timeout=2).status_code == 200
-        assert asset_entered.is_set()
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            run_task = asyncio.create_task(
+                client.post(f"/api/cases/{case['id']}/messages", json={'content': '开始核查'})
+            )
+            assert await asyncio.to_thread(run_entered.wait, 1), 'run request did not enter harness'
+            asset_task = asyncio.create_task(
+                client.post(
+                    f"/api/cases/{case['id']}/assets",
+                    files={'file': ('serialized.txt', b'evidence', 'text/plain')},
+                )
+            )
+            await asyncio.sleep(0.12)
+            assert not asset_entered.is_set(), 'asset mutation crossed an in-flight run start'
+            release_run.set()
+            run_response, asset_response = await asyncio.wait_for(
+                asyncio.gather(run_task, asset_task), timeout=2
+            )
+            assert run_response.status_code == 200
+            assert asset_response.status_code == 200
+            assert asset_entered.is_set()
+
+    asyncio.run(scenario())
