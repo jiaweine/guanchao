@@ -2,6 +2,7 @@ import { caseIdFromRequest, currentCaseIdFromHref, isCaseDetailRequest, requestM
 
 const EMPTY_DRAFT = Object.freeze({ message: '', note: '' });
 const EDITABLE_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+const BATCH_HEADER_KEYS = new Set(['platform', 'handle', 'bio', 'posts', 'profile_url']);
 
 function cleanDraft(value = {}) {
   return {
@@ -60,6 +61,51 @@ export function shouldBlockReviewShortcut({ key, modalOpen, targetTagName = '' }
   );
 }
 
+function unquoteHeaderCell(cell) {
+  const trimmed = String(cell || '').trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
+    return { quoted: true, value: trimmed.slice(1, -1) };
+  }
+  return { quoted: false, value: trimmed };
+}
+
+export function normalizeBatchHeaderText(text) {
+  const raw = String(text || '');
+  if (!raw) return raw;
+  const newline = raw.search(/\r?\n/);
+  const firstLine = (newline >= 0 ? raw.slice(0, newline) : raw).replace(/^\uFEFF/, '');
+  const rest = newline >= 0 ? raw.slice(newline) : '';
+  const cells = firstLine.split(',');
+  const normalizedValues = cells.map((cell) => unquoteHeaderCell(cell).value.replace(/^\uFEFF/, '').trim());
+  const hasHeader = normalizedValues.some((value) => value.toLowerCase() === 'handle' || value === '账号');
+  if (!hasHeader) return firstLine + rest;
+
+  const normalized = cells.map((cell) => {
+    const parsed = unquoteHeaderCell(cell);
+    const value = parsed.value.replace(/^\uFEFF/, '').trim();
+    const lower = value.toLowerCase();
+    const next = BATCH_HEADER_KEYS.has(lower) ? lower : value;
+    return parsed.quoted ? `"${next}"` : next;
+  });
+  return normalized.join(',') + rest;
+}
+
+export function guardCaseBoundBlob(response, requestCaseId, getSelectedCaseId) {
+  if (!response?.ok || !requestCaseId || typeof response.blob !== 'function') return response;
+  const originalBlob = response.blob.bind(response);
+  Object.defineProperty(response, 'blob', {
+    configurable: true,
+    value: async () => {
+      const blob = await originalBlob();
+      if (getSelectedCaseId() !== requestCaseId) {
+        throw new Error('已切换到另一调查，原调查报告未下载。');
+      }
+      return blob;
+    },
+  });
+  return response;
+}
+
 function visibleModal(documentRef) {
   return [...documentRef.querySelectorAll?.('.modal-backdrop') || []].find((item) => !item.hidden) || null;
 }
@@ -85,6 +131,10 @@ function isCaseDelete(meta) {
   return meta.method === 'DELETE' && /^\/api\/cases\/[^/]+$/.test(meta.url.pathname);
 }
 
+function isCaseReport(meta) {
+  return meta.method === 'GET' && /^\/api\/cases\/[^/]+\/report$/.test(meta.url.pathname);
+}
+
 export function installCaseContextGuards({ windowRef = window, documentRef = document } = {}) {
   const registry = createDraftRegistry();
   const initialCaseId = currentCaseIdFromHref(windowRef.location.href);
@@ -98,6 +148,12 @@ export function installCaseContextGuards({ windowRef = window, documentRef = doc
   ['#messageInput', '#caseNoteInput'].forEach((selector) => {
     documentRef.querySelector?.(selector)?.addEventListener?.('input', saveCurrent);
   });
+
+  const batchForm = documentRef.querySelector?.('#batchForm');
+  batchForm?.addEventListener?.('submit', () => {
+    const input = documentRef.querySelector?.('#batchInput');
+    if (input) input.value = normalizeBatchHeaderText(input.value);
+  }, true);
 
   documentRef.addEventListener('keydown', (event) => {
     if (!shouldBlockReviewShortcut({
@@ -129,6 +185,9 @@ export function installCaseContextGuards({ windowRef = window, documentRef = doc
       }
     }
 
+    if (isCaseReport(meta) && response.ok) {
+      return guardCaseBoundBlob(response, caseIdFromRequest(meta), () => registry.current());
+    }
     return response;
   };
 
