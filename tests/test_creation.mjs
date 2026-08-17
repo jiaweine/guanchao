@@ -59,13 +59,18 @@ test('real create sequence keeps transition through case detail load until initi
   assert.equal(transitionHeader, 'case-b');
 });
 
-test('switching away during new case open never sends the new goal to another case', async () => {
+test('switching away during new case open starts the run on the created case but never leaks its run state into the selected case', async () => {
   const recoveries = [];
   const messageTargets = [];
-  const downstreamFetch = async (input) => {
+  const transitionHeaders = [];
+  const downstreamFetch = async (input, init = {}) => {
     const path = new URL(String(input), 'http://local/').pathname;
     if (path === '/api/cases') return response({ id: 'case-b' });
-    if (path.endsWith('/messages')) messageTargets.push(path);
+    if (path.endsWith('/messages')) {
+      messageTargets.push(path);
+      transitionHeaders.push(new Headers(init.headers || {}).get('X-Guanchao-Case-Transition') || '');
+      return response({ run_id: 'run-b' });
+    }
     return response({ id: 'case-b', runs: [] });
   };
   const guarded = createCreationFetch({
@@ -76,14 +81,41 @@ test('switching away during new case open never sends the new goal to another ca
 
   await guarded('/api/cases', { method: 'POST', body: '{}' });
   await guarded('/api/cases/case-b');
-  const blocked = await guarded('/api/cases/case-c/messages', {
+  const protectedResponse = await guarded('/api/cases/case-c/messages', {
     method: 'POST',
     body: JSON.stringify({ content: 'B 的首次核查目标' }),
   });
-  assert.equal(blocked.status, 409);
-  assert.deepEqual(messageTargets, []);
-  assert.equal(recoveries.length, 1);
-  assert.equal(recoveries[0][0], 'case-b');
+  assert.equal(protectedResponse.status, 409);
+  assert.deepEqual(messageTargets, ['/api/cases/case-b/messages']);
+  assert.deepEqual(transitionHeaders, ['case-b']);
+  assert.deepEqual(recoveries, []);
+  assert.match((await protectedResponse.json()).detail, /已在原账号中开始核查/);
+});
+
+test('duplicate cross-case initial sends share one run start on the created case', async () => {
+  let resolveRun;
+  let calls = 0;
+  const downstreamFetch = async (input) => {
+    const path = new URL(String(input), 'http://local/').pathname;
+    if (path === '/api/cases') return response({ id: 'case-b' });
+    if (path === '/api/cases/case-b/messages') {
+      calls += 1;
+      return new Promise((resolve) => { resolveRun = resolve; });
+    }
+    return response({ id: 'case-b', runs: [] });
+  };
+  const guarded = createCreationFetch({ downstreamFetch, getHref: () => 'http://local/?case=case-c' });
+  await guarded('/api/cases', { method: 'POST', body: '{}' });
+  await guarded('/api/cases/case-b');
+
+  const init = { method: 'POST', body: JSON.stringify({ content: '首次核查' }) };
+  const first = guarded('/api/cases/case-c/messages', init);
+  const second = guarded('/api/cases/case-c/messages', init);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls, 1);
+  resolveRun(response({ run_id: 'run-b' }));
+  assert.equal((await first).status, 409);
+  assert.equal((await second).status, 409);
 });
 
 test('failed initial run recovers the already-created case instead of encouraging duplicate creation', async () => {
