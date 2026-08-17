@@ -195,13 +195,16 @@ class AgentHarness:
                     self.store.add_message(case_id, "assistant", state["answer"])
                 if decision.features:
                     after = policy.signal(state)
+                    reward = policy.reward(before, after, decision.tool, duration_ms)
+                    if decision.tool == "verdict.compose":
+                        reward = max(reward, before["verdict_readiness"])
                     state["trajectory"].append(
                         {
                             "action": decision.tool,
                             "features": decision.features,
                             "alternative": decision.alternative,
                             "alternative_features": decision.alternative_features,
-                            "reward": policy.reward(before, after, decision.tool, duration_ms),
+                            "reward": reward,
                             "duration_ms": duration_ms,
                         }
                     )
