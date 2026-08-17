@@ -71,7 +71,7 @@ def test_list_and_review_queue_use_compact_summaries(tmp_path):
     assert detail["runs"][0]["state"]["primary_result"]["features"]
 
 
-def test_readme_images_are_retina_resolution_and_math_is_github_safe():
+def test_readme_uses_portable_markdown_images_and_github_safe_math():
     text = Path("README.md").read_text(encoding="utf-8")
     png_images = [
         "docs/product-preview.png",
@@ -86,8 +86,15 @@ def test_readme_images_are_retina_resolution_and_math_is_github_safe():
         "docs/product-evidence.svg",
     ]
 
+    # Keep README product visuals on native Markdown syntax. Embedded README
+    # renderers can strip HTML images/tables even when github.com accepts them.
+    assert "<img" not in text.lower()
+    assert "<table" not in text.lower()
+    assert 'width="' not in text.lower()
+
     for image in png_images:
-        assert image in text
+        markdown_ref = f"](./{image})"
+        assert markdown_ref in text
         path = Path(image)
         assert path.is_file()
         width, height = _png_dimensions(path)
