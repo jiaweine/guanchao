@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 import time
 import weakref
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from .api_core import create_app as create_core_app
+from .api_core import MAX_UPLOAD_BYTES, create_app as create_core_app
+from .multimodal import infer_kind
 
 IDEMPOTENCY_TTL_SECONDS = 600.0
 IDEMPOTENCY_CACHE_LIMIT = 256
@@ -64,12 +67,23 @@ async def _record_response(response: Response) -> tuple[int, dict[str, str], byt
     return response.status_code, dict(response.headers), body
 
 
+def _persist_asset_file(asset_dir: Path, case_id: str, filename: str, data: bytes) -> str:
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(filename).suffix[:12]
+    with tempfile.NamedTemporaryFile(
+        prefix=f'{case_id}-', suffix=suffix, dir=asset_dir, delete=False
+    ) as handle:
+        handle.write(data)
+        return handle.name
+
+
 def create_app(db_path: str | None = None) -> FastAPI:
     app = create_core_app(db_path)
     case_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
     idempotency_guard = asyncio.Lock()
     idempotency_cache: OrderedDict[str, tuple[float, tuple[int, dict[str, str], bytes]]] = OrderedDict()
     idempotency_inflight: dict[str, asyncio.Future[tuple[int, dict[str, str], bytes] | None]] = {}
+    perception_slots = asyncio.Semaphore(max(1, int(os.getenv('GUANCHAO_PERCEPTION_WORKERS', '4'))))
 
     def lock_for(case_id: str) -> asyncio.Lock:
         lock = case_locks.get(case_id)
@@ -126,6 +140,75 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 waiter.set_result(record)
         return _response_from_record(record)
 
+    async def upload_asset_without_blocking_loop(
+        request: Request,
+        case_id: str,
+        actor_id: str,
+    ) -> Response:
+        form = await request.form()
+        file = form.get('file')
+        if file is None or not hasattr(file, 'read'):
+            return JSONResponse(status_code=422, content={'detail': '缺少素材文件'})
+
+        filename = Path(getattr(file, 'filename', '') or 'asset').name[:180]
+        content_type = getattr(file, 'content_type', None) or 'application/octet-stream'
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if not data:
+            return JSONResponse(status_code=422, content={'detail': '素材内容为空'})
+        if len(data) > MAX_UPLOAD_BYTES:
+            return JSONResponse(status_code=413, content={'detail': '单个素材超过上传上限'})
+
+        kind = infer_kind(content_type, filename)
+        storage_path = await asyncio.to_thread(
+            _persist_asset_file, app.state.store.asset_dir, case_id, filename, data
+        )
+        try:
+            asset = await asyncio.to_thread(
+                app.state.store.create_asset,
+                case_id,
+                filename,
+                kind,
+                content_type,
+                len(data),
+                storage_path,
+                actor_id,
+            )
+        except Exception:
+            await asyncio.to_thread(Path(storage_path).unlink, missing_ok=True)
+            raise
+
+        try:
+            async with perception_slots:
+                extracted, asset_status = await asyncio.to_thread(
+                    app.state.perception.extract, storage_path, kind, content_type
+                )
+            note = (
+                '已读取'
+                if asset_status == 'ready'
+                else '已保存，等待本地感知服务'
+                if asset_status == 'pending'
+                else '解析失败'
+            )
+            await asyncio.to_thread(
+                app.state.store.update_asset,
+                asset.id,
+                asset_status,
+                extracted,
+                '' if asset_status != 'error' else 'perception_failed',
+                note,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                app.state.store.update_asset,
+                asset.id,
+                'error',
+                '',
+                'perception_failed',
+                '解析失败，可重新上传或检查本地感知服务',
+            )
+        public_asset = await asyncio.to_thread(app.state.store.get_asset, asset.id, False)
+        return JSONResponse(content=public_asset)
+
     @app.middleware('http')
     async def enforce_product_state_consistency(request: Request, call_next: Any):
         path = request.url.path
@@ -142,6 +225,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             member = _request_member(app, request) if needs_guard else None
             can_manage = bool(member and member.get('role') in {'admin', 'analyst'})
 
+            case = None
             if can_manage and case_id:
                 try:
                     case = app.state.store.get_case(case_id)
@@ -157,6 +241,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         status_code=409,
                         content={'detail': '当前核查仍在进行，请完成后再修改素材，避免本轮证据快照发生歧义'},
                     )
+
+            if is_asset_upload and can_manage and case_id and case:
+                return await upload_asset_without_blocking_loop(request, case_id, member['id'])
 
             response = await call_next(request)
 
