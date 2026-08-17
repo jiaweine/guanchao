@@ -1,20 +1,35 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
-<rect width="1440" height="900" fill="#f2f0ea"/><rect x="236" y="62" width="844" height="838" fill="#faf9f5"/><rect x="1080" y="62" width="360" height="838" fill="#eceae4"/><rect y="62" width="236" height="838" fill="#eae8e1"/>
-<g stroke="#d8d6cf"><path d="M0 62H1440M236 0V900M1080 62V900"/><path d="M236 178H1080M1080 111H1440"/></g>
-<g font-family="system-ui,-apple-system,'PingFang SC',sans-serif" fill="#191d1c">
-<text x="55" y="39" font-size="20" font-weight="700">观潮</text><text x="105" y="39" font-size="10" fill="#707772">内容调查工作台</text>
-<circle cx="258" cy="31" r="4" fill="#3f6e57"/><text x="270" y="36" font-size="11" fill="#707772">工作空间可用 · 待复核 0 · 文本 · 图片 · 视频 · 音频 · 文档</text>
-<rect x="1305" y="14" width="113" height="36" rx="18" fill="#191d1c"/><text x="1332" y="37" font-size="11" fill="#fff">新建调查</text>
-<text x="18" y="91" font-size="11" font-weight="700">待复核</text><text x="177" y="91" font-size="10" fill="#707772">查看全部</text>
-<circle cx="31" cy="146" r="11" fill="none" stroke="#bdbbb3"/><text x="27" y="151" font-size="16">+</text><text x="51" y="150" font-size="12" font-weight="650">新建调查</text>
-<text x="20" y="218" font-size="12" font-weight="650">没有待复核任务</text><text x="20" y="243" font-size="10" fill="#707772">新结论完成后会自动进入这里。</text>
-<text x="264" y="102" font-size="9" fill="#707772">跨平台调查</text><text x="264" y="132" font-size="23" font-weight="700">查清一个账号，不只看一条内容。</text><text x="264" y="156" font-size="11" fill="#707772">给出目标和现有资料。系统会自己决定先看什么、哪里需要反向核对，以及什么时候证据足够。</text>
-<text x="264" y="261" font-size="9" fill="#2e6760" font-weight="700">调查从目标开始</text><text x="264" y="318" font-size="48" font-weight="700">把账号、内容和素材放进来。</text><text x="264" y="369" font-size="48" fill="#2e6760" font-weight="700">剩下的核查顺序交给系统。</text><text x="264" y="416" font-size="13" fill="#707772">主页、近期内容、图片、视频、音频、文档可以放在同一个任务里持续补充。</text>
-<path d="M264 463H1052M264 536H1052M264 609H1052M264 682H1052" stroke="#d8d6cf"/>
-<text x="267" y="505" font-size="9" fill="#707772">01</text><text x="313" y="495" font-size="13" font-weight="650">判断一个账号是不是长期营销运营</text><text x="313" y="516" font-size="10" fill="#707772">从主页、近期内容和重复模式开始</text>
-<text x="267" y="578" font-size="9" fill="#707772">02</text><text x="313" y="568" font-size="13" font-weight="650">我有图片或视频，结合内容一起核查</text><text x="313" y="589" font-size="10" fill="#707772">素材和文本进入同一条证据链</text>
-<text x="267" y="651" font-size="9" fill="#707772">03</text><text x="313" y="641" font-size="13" font-weight="650">这个账号很商业，但我担心误判</text><text x="313" y="662" font-size="10" fill="#707772">优先检查稳定性和相反证据</text>
-<rect x="264" y="764" width="788" height="106" rx="13" fill="#fffdf9" stroke="#bdbbb3"/><text x="282" y="800" font-size="12" fill="#707772">继续追问、要求反向核查，或补充新的判断目标…</text><text x="282" y="850" font-size="10" fill="#707772">＋ 添加素材</text><rect x="983" y="826" width="52" height="30" rx="15" fill="#191d1c"/><text x="999" y="846" font-size="10" fill="#fff">发送</text>
-<text x="1098" y="92" font-size="10" font-weight="650">判断</text><text x="1143" y="92" font-size="10" fill="#707772">证据</text><text x="1187" y="92" font-size="10" fill="#707772">素材</text><text x="1230" y="92" font-size="10" fill="#707772">过程</text><path d="M1097 109H1121" stroke="#2e6760" stroke-width="2"/>
-<circle cx="1260" cy="275" r="25" fill="none" stroke="#bdbbb3"/><circle cx="1260" cy="275" r="4" fill="#2e6760"/><text x="1224" y="331" font-size="13" font-weight="650">等待核查</text><text x="1158" y="360" font-size="10" fill="#707772">完成第一轮核查后，这里只保留结论、把握度</text><text x="1195" y="379" font-size="10" fill="#707772">和真正需要补的资料。</text>
-</g></svg>
+  <rect width="1440" height="900" fill="#f2f0ea"/>
+  <rect x="236" y="62" width="844" height="838" fill="#faf9f5"/>
+  <rect x="1080" y="62" width="360" height="838" fill="#eceae4"/>
+  <rect y="62" width="236" height="838" fill="#eae8e1"/>
+  <g stroke="#d8d6cf" fill="none"><path d="M0 62H1440M236 0V900M1080 62V900"/><path d="M0 111H236M236 180H1080M1080 111H1440"/></g>
+  <g font-family="system-ui,-apple-system,'PingFang SC',sans-serif" fill="#191d1c">
+    <text x="55" y="39" font-size="20" font-weight="700">观潮</text><text x="105" y="39" font-size="10" fill="#707772">内容调查工作台</text>
+    <circle cx="258" cy="31" r="4" fill="#3f6e57"/><text x="270" y="36" font-size="11" fill="#707772">本机管理员 · 工作空间可用 · 待复核 6 · 待更新 2</text>
+    <rect x="1182" y="14" width="72" height="36" rx="18" fill="#faf9f5" stroke="#bdbbb3"/><text x="1199" y="37" font-size="10">工作空间</text>
+    <rect x="1262" y="14" width="72" height="36" rx="18" fill="#faf9f5" stroke="#bdbbb3"/><text x="1280" y="37" font-size="10">批量导入</text>
+    <rect x="1342" y="14" width="80" height="36" rx="18" fill="#191d1c"/><text x="1359" y="37" font-size="10" fill="#fff">新建调查</text>
+
+    <text x="18" y="91" font-size="10" font-weight="700">待复核</text><text x="92" y="91" font-size="9" fill="#707772">全部</text><text x="158" y="91" font-size="9" fill="#707772">待更新</text><path d="M18 109H58" stroke="#2e6760" stroke-width="2"/>
+    <rect x="11" y="124" width="214" height="32" rx="8" fill="#f7f5f0" stroke="#d8d6cf"/><text x="25" y="144" font-size="9" fill="#707772">⌕  搜索账号或调查</text>
+    <rect x="11" y="163" width="103" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="23" y="181" font-size="8" fill="#707772">全部平台</text><rect x="121" y="163" width="104" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="132" y="181" font-size="8" fill="#707772">全部负责人</text>
+    <rect x="11" y="198" width="103" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="23" y="216" font-size="8" fill="#707772">全部优先级</text><rect x="121" y="198" width="104" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="132" y="216" font-size="8" fill="#707772">复核优先</text>
+    <circle cx="31" cy="258" r="11" fill="none" stroke="#bdbbb3"/><text x="27" y="263" font-size="16">+</text><text x="51" y="262" font-size="12" font-weight="650">新建调查</text>
+    <rect x="9" y="289" width="218" height="58" rx="8" fill="#f8f7f3"/><circle cx="20" cy="307" r="3" fill="#2e6760"/><text x="31" y="309" font-size="10" font-weight="650">橙子生活研究所</text><text x="31" y="328" font-size="8" fill="#707772">小红书 · 明显营销倾向 · 82%</text><rect x="177" y="300" width="40" height="16" rx="8" fill="none" stroke="#9fb8b1"/><text x="186" y="311" font-size="7" fill="#2e6760">复核 88</text>
+
+    <text x="264" y="101" font-size="9" fill="#707772">小红书 · 橙子生活研究所</text><text x="264" y="132" font-size="22" font-weight="700">橙子生活研究所 · 内容调查</text><text x="264" y="156" font-size="11" fill="#707772">判断这个账号是否长期营销运营，并优先核查相反证据。</text>
+    <rect x="264" y="166" width="42" height="18" rx="9" fill="#eeece6"/><text x="275" y="178" font-size="7" fill="#707772">高优先</text><rect x="312" y="166" width="48" height="18" rx="9" fill="#eeece6"/><text x="322" y="178" font-size="7" fill="#707772">本周重点</text><rect x="366" y="166" width="42" height="18" rx="9" fill="#eeece6"/><text x="377" y="178" font-size="7" fill="#707772">监测中</text>
+    <rect x="765" y="88" width="82" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="777" y="106" font-size="8">本机管理员</text><rect x="854" y="88" width="55" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="871" y="106" font-size="8">高</text><rect x="916" y="88" width="58" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="930" y="106" font-size="8">每周</text><rect x="981" y="88" width="61" height="28" rx="7" fill="none" stroke="#d8d6cf"/><text x="996" y="106" font-size="8">停止监测</text>
+    <text x="264" y="263" font-size="9" fill="#707772">你</text><text x="336" y="270" font-size="15" font-weight="550">仔细核查，避免把普通创作者误判成营销运营。</text><path d="M336 300H1052" stroke="#d8d6cf"/>
+    <text x="264" y="328" font-size="9" fill="#707772">观潮</text><text x="336" y="334" font-size="12">该账号存在持续营销倾向，但仍保留少量个人生活表达；建议结合合作披露与近期内容继续人工复核。</text>
+    <rect x="264" y="764" width="788" height="106" rx="13" fill="#fffdf9" stroke="#bdbbb3"/><text x="282" y="800" font-size="12" fill="#707772">继续追问、要求反向核查，或补充新的判断目标…</text><text x="282" y="850" font-size="10" fill="#707772">＋ 添加素材 · 图片 · 视频 · 音频 · 文档</text><rect x="983" y="826" width="52" height="30" rx="15" fill="#191d1c"/><text x="999" y="846" font-size="10" fill="#fff">发送</text>
+
+    <text x="1098" y="92" font-size="10" font-weight="650">判断</text><text x="1143" y="92" font-size="10" fill="#707772">证据</text><text x="1187" y="92" font-size="10" fill="#707772">素材</text><text x="1230" y="92" font-size="10" fill="#707772">过程</text><text x="1273" y="92" font-size="10" fill="#707772">记录</text><path d="M1097 109H1121" stroke="#2e6760" stroke-width="2"/>
+    <text x="1098" y="153" font-size="8" fill="#707772">当前判断</text><text x="1098" y="192" font-size="30" font-weight="700">明显营销倾向</text><text x="1098" y="222" font-size="10" fill="#707772">重复合作表述、优惠引导与相似转化动作持续出现。</text><path d="M1098 246H1420" stroke="#d8d6cf"/>
+    <text x="1098" y="278" font-size="9" fill="#707772">把握度</text><text x="1098" y="304" font-size="17" font-weight="700">82%</text><path d="M1098 322H1250" stroke="#d8d6cf"/><path d="M1098 322H1222" stroke="#2e6760" stroke-width="2"/>
+    <text x="1272" y="278" font-size="9" fill="#707772">稳定性</text><text x="1272" y="304" font-size="17" font-weight="700">74%</text><path d="M1272 322H1420" stroke="#d8d6cf"/><path d="M1272 322H1381" stroke="#61746d" stroke-width="2"/>
+    <path d="M1098 350H1420" stroke="#d8d6cf"/><text x="1098" y="380" font-size="9" fill="#707772">营销倾向</text><text x="1098" y="407" font-size="17" font-weight="700">79%</text><text x="1272" y="380" font-size="9" fill="#707772">隐性推广风险</text><text x="1272" y="407" font-size="17" font-weight="700">68%</text>
+    <text x="1098" y="460" font-size="9" fill="#707772">如果要更稳</text><text x="1110" y="488" font-size="10" fill="#707772">• 补充最近 30 天完整内容序列</text>
+  </g>
+</svg>

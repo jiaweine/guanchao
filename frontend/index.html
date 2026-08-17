@@ -6,41 +6,62 @@
   <meta name="theme-color" content="#f2f0ea" />
   <title>观潮 · 内容调查工作台</title>
   <link rel="stylesheet" href="/assets/app.css" />
+  <link rel="stylesheet" href="/assets/workflow.css" />
 </head>
 <body>
 <div class="app-shell" id="appShell">
   <header class="topbar">
     <a class="brand" href="/" aria-label="观潮首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span><strong>观潮</strong><small>内容调查工作台</small></span></a>
-    <div class="top-context"><span class="live-dot"></span><span>工作空间可用</span><span class="top-sep"></span><span id="queueSummary">待复核 0</span><span class="top-sep"></span><span>文本 · 图片 · 视频 · 音频 · 文档</span></div>
-    <div class="top-actions"><button class="quiet-action" id="demoBtn">载入示例</button><button class="primary-action" id="newCaseBtn">新建调查</button></div>
+    <div class="top-context"><span class="live-dot"></span><span id="workspaceState">工作空间可用</span><span class="top-sep"></span><span id="queueSummary">待复核 0</span><span class="top-sep"></span><span id="monitorSummary">待更新 0</span></div>
+    <div class="top-actions"><button class="quiet-action" id="workspaceBtn">工作空间</button><button class="quiet-action" id="batchBtn">批量导入</button><button class="primary-action" id="newCaseBtn">新建调查</button></div>
   </header>
 
   <aside class="case-rail">
-    <div class="rail-heading"><span id="listTitle">待复核</span><button id="listModeBtn" aria-label="切换调查列表">查看全部</button></div>
+    <div class="rail-tabs" role="tablist">
+      <button class="active" data-list-mode="queue">待复核</button>
+      <button data-list-mode="all">全部</button>
+      <button data-list-mode="watch">待更新</button>
+    </div>
+    <div class="rail-filters">
+      <label class="search-field"><span aria-hidden="true">⌕</span><input id="caseSearch" placeholder="搜索账号或调查" autocomplete="off" /></label>
+      <div class="filter-row">
+        <select id="platformFilter" aria-label="平台筛选"><option value="">全部平台</option><option value="xiaohongshu">小红书</option><option value="weibo">微博</option><option value="douyin">抖音</option><option value="bilibili">B站</option><option value="other">其他</option></select>
+        <select id="ownerFilter" aria-label="负责人筛选"><option value="">全部负责人</option></select>
+      </div>
+      <div class="filter-row">
+        <select id="priorityFilter" aria-label="业务优先级筛选"><option value="">全部优先级</option><option value="high">高优先</option><option value="normal">常规</option><option value="low">低优先</option></select>
+        <select id="sortFilter" aria-label="排序"><option value="priority_desc">复核优先</option><option value="risk_desc">营销倾向</option><option value="newest">最近完成</option></select>
+      </div>
+    </div>
     <button class="new-case-row" id="newCaseRailBtn"><span>＋</span><b>新建调查</b></button>
-    <div class="case-list" id="caseList"><div class="case-empty"><strong>正在读取</strong><p>正在整理需要人工确认的调查。</p></div></div>
-    <div class="rail-foot"><span class="live-dot"></span><div><b>证据优先</b><small>优先处理尚未人工确认的结论；资料不足时允许保留“无法判断”。</small></div></div>
+    <div class="case-list" id="caseList"><div class="case-empty"><strong>正在读取</strong><p>正在整理需要人工处理的调查。</p></div></div>
+    <div class="rail-foot"><span class="live-dot"></span><div><b>证据优先</b><small id="railFootCopy">高风险、低稳定或业务高优先的结果会优先进入复核。</small></div></div>
   </aside>
 
   <main class="workspace" id="workspace">
     <section class="workspace-head">
-      <div class="workspace-title"><span class="eyebrow" id="casePlatform">跨平台调查</span><h1 id="caseTitle">查清一个账号，不只看一条内容。</h1><p id="caseMeta">给出目标和现有资料。系统会自己决定先看什么、哪里需要反向核对，以及什么时候证据足够。</p></div>
-      <div class="review-actions" id="workspaceTools" hidden>
-        <button id="deleteCaseBtn">删除调查</button>
-        <span id="reviewHint">人工复核</span>
-        <button id="markNormalBtn">普通创作者</button>
-        <button id="markUncertainBtn">无法判断</button>
-        <button class="danger-soft" id="markMarketingBtn">营销运营</button>
+      <div class="workspace-title"><span class="eyebrow" id="casePlatform">跨平台调查</span><h1 id="caseTitle">查清一个账号，不只看一条内容。</h1><p id="caseMeta">把账号、内容和素材放进来；系统负责核查顺序，人工负责最后确认。</p><div class="case-tags" id="caseTags" hidden></div></div>
+      <div class="workspace-controls" id="workspaceTools" hidden>
+        <div class="case-control-row">
+          <label><span>负责人</span><select id="caseOwnerSelect"></select></label>
+          <label><span>业务优先级</span><select id="casePrioritySelect"><option value="high">高</option><option value="normal">常规</option><option value="low">低</option></select></label>
+          <label><span>监测周期</span><select id="monitorInterval"><option value="24">每天</option><option value="72">每 3 天</option><option value="168">每周</option><option value="720">每月</option></select></label>
+          <button id="monitorBtn">加入监测</button>
+        </div>
+        <div class="case-action-row">
+          <button id="refreshSourceBtn">更新资料</button><button id="reportBtn">导出报告</button><button id="copyLinkBtn">复制链接</button><button id="archiveCaseBtn">归档</button><button id="deleteCaseBtn">删除</button>
+        </div>
+        <div class="review-actions" id="reviewActions" hidden><span id="reviewHint">人工复核</span><button id="markNormalBtn"><kbd>1</kbd> 普通创作者</button><button id="markUncertainBtn"><kbd>2</kbd> 无法判断</button><button class="danger-soft" id="markMarketingBtn"><kbd>3</kbd> 营销运营</button></div>
       </div>
     </section>
 
     <section class="conversation" id="conversation">
       <div class="welcome" id="welcome">
-        <div class="welcome-copy"><span class="welcome-index">调查从目标开始</span><h2>把账号、内容和素材放进来。<br><em>剩下的核查顺序交给系统。</em></h2><p>主页、近期内容、图片、视频、音频、文档可以放在同一个任务里持续补充。每一步都留下依据，结论不稳时会主动找反向线索。</p></div>
+        <div class="welcome-copy"><span class="welcome-index">从一条任务，到一整批账号</span><h2>批量调查先排序。<br><em>人工只看最值得看的。</em></h2><p>单个账号可以持续补文本、图片、视频、音频和文档；一批账号可以自动进入核查与复核队列。结论不稳时会主动找相反证据。</p></div>
         <div class="starter-list">
-          <button data-demo="1"><span>01</span><div><b>判断一个账号是不是长期营销运营</b><small>从主页、近期内容和重复模式开始</small></div><i>→</i></button>
-          <button data-open="new"><span>02</span><div><b>我有图片或视频，结合内容一起核查</b><small>素材和文本进入同一条证据链</small></div><i>→</i></button>
-          <button data-open="new"><span>03</span><div><b>这个账号很商业，但我担心误判</b><small>优先检查稳定性和相反证据</small></div><i>→</i></button>
+          <button data-demo="1"><span>01</span><div><b>先看一个完整示例</b><small>从资料进入，到结论与人工复核</small></div><i>→</i></button>
+          <button data-open="batch"><span>02</span><div><b>导入一批账号，让系统先排复核顺序</b><small>CSV、JSON 或直接粘贴账号列表</small></div><i>→</i></button>
+          <button data-open="new"><span>03</span><div><b>调查一个账号，并持续监测变化</b><small>更新资料后自动重新核查</small></div><i>→</i></button>
         </div>
       </div>
       <div class="message-list" id="messageList"></div>
@@ -51,7 +72,7 @@
       <div class="upload-tray" id="uploadTray" hidden></div>
       <div class="composer">
         <textarea id="messageInput" rows="1" placeholder="继续追问、要求反向核查，或补充新的判断目标…"></textarea>
-        <div class="composer-tools"><div><button class="attach-action" id="attachBtn" type="button"><span>＋</span>添加素材</button><span class="composer-note" id="composerHint">可继续补图片、视频、音频和文档</span></div><button class="send-action" id="sendBtn" aria-label="发送">发送</button></div>
+        <div class="composer-tools"><div><button class="attach-action" id="attachBtn" type="button"><span>＋</span>添加素材</button><span class="composer-note" id="composerHint">图片 · 视频 · 音频 · 文档</span></div><button class="send-action" id="sendBtn" aria-label="发送">发送</button></div>
         <input id="assetInput" type="file" multiple hidden accept="image/*,video/*,audio/*,.txt,.md,.csv,.json,.log,.pdf,.docx" />
       </div>
       <p class="fineprint">结果用于辅助研判；涉及处置、处罚或事实认定时，应结合平台规则与人工复核。</p>
@@ -59,10 +80,10 @@
   </main>
 
   <aside class="insight-rail">
-    <div class="insight-tabs" role="tablist"><button class="active" data-tab="summary">判断</button><button data-tab="evidence">证据</button><button data-tab="assets">素材</button><button data-tab="trace">过程</button></div>
+    <div class="insight-tabs" role="tablist"><button class="active" data-tab="summary">判断</button><button data-tab="evidence">证据</button><button data-tab="assets">素材</button><button data-tab="trace">过程</button><button data-tab="audit">记录</button></div>
     <div class="insight-body">
       <section class="tab-panel active" id="tab-summary">
-        <div class="empty-insight" id="summaryEmpty"><span class="empty-mark"></span><strong>等待核查</strong><p>完成第一轮核查后，这里只保留结论、把握度和真正需要补的资料。</p></div>
+        <div class="empty-insight" id="summaryEmpty"><span class="empty-mark"></span><strong>等待核查</strong><p>完成核查后，这里保留结论、把握度、稳定性和真正需要补的资料。</p></div>
         <div id="summaryContent" hidden>
           <div class="verdict"><span class="section-cap">当前判断</span><h3 id="verdictLabel">—</h3><p id="summaryCopy"></p></div>
           <div class="metric-row"><div><span>把握度</span><strong id="confidenceValue">—</strong><div class="meter"><i id="confidenceMeter"></i></div></div><div><span>稳定性</span><strong id="stabilityValue">—</strong><div class="meter secondary"><i id="stabilityMeter"></i></div></div></div>
@@ -73,6 +94,11 @@
       <section class="tab-panel" id="tab-evidence"><div class="evidence-list" id="evidenceList"><div class="side-empty">关键证据会按支持、反向和背景分别保留。</div></div></section>
       <section class="tab-panel" id="tab-assets"><div class="asset-list" id="assetList"><div class="side-empty">还没有添加素材。</div></div></section>
       <section class="tab-panel" id="tab-trace"><div class="trace-list" id="traceList"><div class="side-empty">每一步核查都会留在这里。</div></div></section>
+      <section class="tab-panel" id="tab-audit">
+        <div class="case-note-composer"><textarea id="caseNoteInput" rows="2" maxlength="2000" placeholder="给同事留一条协作备注…"></textarea><div><small>⌘/Ctrl + Enter</small><button id="addCaseNoteBtn" type="button">添加备注</button></div></div>
+        <div class="record-section"><span class="section-cap">协作备注</span><div class="team-notes" id="teamNotes"><div class="side-empty">还没有协作备注。</div></div></div>
+        <div class="record-section"><span class="section-cap">操作记录</span><div class="audit-list" id="auditList"><div class="side-empty">负责人变更、复核、监测和数据操作会留在这里。</div></div></div>
+      </section>
     </div>
   </aside>
 </div>
@@ -80,19 +106,60 @@
 <div class="drop-layer" id="dropLayer" hidden><div><span>＋</span><b>松开即可加入当前调查</b><small>支持图片、视频、音频和文档</small></div></div>
 
 <div class="modal-backdrop" id="caseModal" hidden>
-  <div class="modal">
-    <div class="modal-head"><div><span class="eyebrow">新建调查</span><h3>先给最少资料，后面再补。</h3><p>账号文本和素材可以任选其一开始；资料越完整，判断越稳定。</p></div><button id="closeModal" aria-label="关闭">×</button></div>
+  <div class="modal modal-wide">
+    <div class="modal-head"><div><span class="eyebrow">新建调查</span><h3>先给最少资料，后面持续补。</h3><p>资料越完整，判断越稳定；负责人和业务优先级会影响复核队列。</p></div><button data-close="caseModal" aria-label="关闭">×</button></div>
     <form id="caseForm">
       <div class="form-grid"><label><span>平台</span><select id="platformInput"><option value="xiaohongshu">小红书</option><option value="weibo">微博</option><option value="douyin">抖音</option><option value="bilibili">B站</option><option value="other">其他</option></select></label><label><span>账号名</span><input id="handleInput" placeholder="账号昵称或标识" required /></label></div>
       <label><span>主页简介 <em>可选</em></span><input id="bioInput" placeholder="把主页简介贴进来" /></label>
+      <label><span>主页链接 <em>可选</em></span><input id="profileUrlInput" type="url" placeholder="https://…" /></label>
       <label><span>近期内容 <em>可先留空</em></span><textarea id="postsInput" rows="5" placeholder="一行一条。也可以只先上传截图、视频或文档。"></textarea></label>
       <div class="modal-upload"><div><span>素材</span><small>图片 / 视频 / 音频 / 文档</small></div><button type="button" id="modalAttachBtn">选择素材</button><input id="modalAssetInput" type="file" multiple hidden accept="image/*,video/*,audio/*,.txt,.md,.csv,.json,.log,.pdf,.docx" /></div>
       <div class="selected-files" id="selectedFiles" hidden></div>
       <label><span>你想知道什么</span><textarea id="goalInput" rows="3" placeholder="例如：判断是否长期营销运营；如果证据不稳，先找相反线索。" required></textarea></label>
-      <div class="modal-actions"><button type="button" id="cancelModal">取消</button><button class="primary-action" type="submit">开始调查</button></div>
+      <div class="form-grid"><label><span>负责人</span><select id="newOwnerSelect"></select></label><label><span>业务优先级</span><select id="newPrioritySelect"><option value="normal">常规</option><option value="high">高</option><option value="low">低</option></select></label></div>
+      <label><span>标签 <em>可选</em></span><input id="tagsInput" placeholder="例如：品牌安全, 本周重点" /></label>
+      <div class="modal-actions"><button type="button" data-close="caseModal">取消</button><button class="primary-action" type="submit">开始调查</button></div>
     </form>
   </div>
 </div>
+
+<div class="modal-backdrop" id="batchModal" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head"><div><span class="eyebrow">批量导入</span><h3>一批账号，自动核查后按复核价值排序。</h3><p>可粘贴 CSV 或 JSON；CSV 列为 platform, handle, bio, posts, profile_url，posts 用 | 分隔多条内容。</p></div><button data-close="batchModal" aria-label="关闭">×</button></div>
+    <form id="batchForm">
+      <label><span>账号列表</span><textarea id="batchInput" rows="9" placeholder="platform,handle,bio,posts,profile_url&#10;weibo,示例账号,生活记录,今天散步|周末做饭,"></textarea></label>
+      <div class="batch-file-row"><button type="button" id="batchFileBtn">选择 CSV / JSON</button><input type="file" id="batchFileInput" accept=".csv,.json,application/json,text/csv" hidden /><span id="batchParseState">尚未解析</span></div>
+      <label><span>统一调查目标</span><textarea id="batchGoalInput" rows="3" required>判断这些账号是否长期营销运营；优先找可验证证据，证据不稳时主动核查相反线索。</textarea></label>
+      <div class="form-grid"><label><span>负责人</span><select id="batchOwnerSelect"></select></label><label><span>业务优先级</span><select id="batchPrioritySelect"><option value="normal">常规</option><option value="high">高</option><option value="low">低</option></select></label></div>
+      <label><span>标签 <em>可选</em></span><input id="batchTagsInput" placeholder="例如：本周筛查, 品牌安全" /></label>
+      <div class="modal-actions"><button type="button" data-close="batchModal">取消</button><button class="primary-action" type="submit">导入并开始核查</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="refreshModal" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head"><div><span class="eyebrow">更新调查资料</span><h3>用最新资料替换当前账号快照。</h3><p>更新后可立即重新核查；加入监测的调查会从这次更新时间重新计算下一次检查。</p></div><button data-close="refreshModal" aria-label="关闭">×</button></div>
+    <form id="refreshForm">
+      <label><span>主页简介</span><input id="refreshBioInput" /></label>
+      <label><span>主页链接 <em>可选</em></span><input id="refreshProfileUrlInput" type="url" /></label>
+      <label><span>近期内容</span><textarea id="refreshPostsInput" rows="8" placeholder="一行一条最新内容"></textarea></label>
+      <label class="check-row"><input id="refreshRerun" type="checkbox" checked /><span>保存后立即重新核查</span></label>
+      <div class="modal-actions"><button type="button" data-close="refreshModal">取消</button><button class="primary-action" type="submit">保存最新资料</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="workspaceModal" hidden>
+  <div class="modal modal-wide workspace-modal">
+    <div class="modal-head"><div><span class="eyebrow">工作空间</span><h3>团队、质量和数据治理。</h3><p>看处理效率与误判趋势，管理负责人，并明确归档数据保留多久。</p></div><button data-close="workspaceModal" aria-label="关闭">×</button></div>
+    <div class="identity-row"><div><span>当前身份</span><strong id="currentActorName">当前成员</strong></div><em id="currentActorRole">成员</em><small>身份由部署侧认证上下文确定；浏览器不能自行切换。关键操作都会进入审计记录。</small></div>
+    <div class="workspace-metrics" id="workspaceMetrics"></div>
+    <div class="settings-section"><div class="section-head"><div><span class="section-cap">成员</span><strong>谁负责调查与复核</strong></div></div><div id="memberList" class="member-list"></div><form id="memberForm" class="inline-form"><input id="memberIdInput" placeholder="成员标识" required /><input id="memberNameInput" placeholder="显示名称" required /><select id="memberRoleInput"><option value="analyst">分析员</option><option value="reviewer">复核员</option><option value="admin">管理员</option></select><button>添加 / 更新</button></form></div>
+    <div class="settings-section"><div class="section-head"><div><span class="section-cap">数据留存</span><strong>只自动清理已归档调查</strong></div></div><div class="retention-row"><label><span>归档后保留</span><input id="retentionDaysInput" type="number" min="0" max="3650" /><small>天；0 表示不自动清理</small></label><button id="saveRetentionBtn">保存策略</button><button id="purgeBtn">立即执行清理</button></div></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 <script type="module" src="/assets/app.js"></script>
 </body>
