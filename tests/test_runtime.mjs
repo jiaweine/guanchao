@@ -45,7 +45,7 @@ test('older case detail response is replaced by the latest requested case', asyn
   assert.equal((await (await first).json()).id, 'b');
 });
 
-test('successful stale write cannot mutate the newly opened case UI', async () => {
+test('successful stale write cannot mutate the newly opened case UI and is marked as applied', async () => {
   let href = 'http://local/?case=a';
   let resolveWrite;
   const nativeFetch = () => new Promise((resolve) => { resolveWrite = resolve; });
@@ -55,6 +55,7 @@ test('successful stale write cannot mutate the newly opened case UI', async () =
   resolveWrite(response({ id: 'a' }));
   const guardedResponse = await write;
   assert.equal(guardedResponse.status, 409);
+  assert.equal(guardedResponse.headers.get('X-Guanchao-Write-Applied'), '1');
   assert.match((await guardedResponse.json()).detail, /原调查/);
 });
 
@@ -86,10 +87,11 @@ test('selected case state closes the gap before the browser URL is updated', asy
   pending.get('PATCH /api/cases/a')(response({ id: 'a' }));
   const staleWrite = await write;
   assert.equal(staleWrite.status, 409);
+  assert.equal(staleWrite.headers.get('X-Guanchao-Write-Applied'), '1');
   assert.match((await staleWrite.json()).detail, /原调查/);
 });
 
-test('stale collaborative note response cannot clear the newly opened case composer', async () => {
+test('stale collaborative note response cannot clear the newly opened case composer but records successful application', async () => {
   let href = 'http://local/?case=a';
   let resolveComment;
   const nativeFetch = () => new Promise((resolve) => { resolveComment = resolve; });
@@ -99,6 +101,7 @@ test('stale collaborative note response cannot clear the newly opened case compo
   resolveComment(response({ ok: true }));
   const guardedResponse = await comment;
   assert.equal(guardedResponse.status, 409);
+  assert.equal(guardedResponse.headers.get('X-Guanchao-Write-Applied'), '1');
   assert.match((await guardedResponse.json()).detail, /原调查/);
 });
 

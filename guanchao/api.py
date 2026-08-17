@@ -68,6 +68,23 @@ async def _record_response(response: Response) -> tuple[int, dict[str, str], byt
     return response.status_code, dict(response.headers), body
 
 
+async def _await_durable_task(task: asyncio.Task[Any]) -> Any:
+    """Let a committed side-effect finish even when the client request is cancelled."""
+    interrupted = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            interrupted = True
+            continue
+    if interrupted:
+        raise asyncio.CancelledError
+    return result
+
+
 def _persist_asset_file(asset_dir: Path, case_id: str, filename: str, data: bytes) -> str:
     asset_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(filename).suffix[:12]
@@ -194,36 +211,40 @@ def create_app(db_path: str | None = None) -> FastAPI:
             await asyncio.to_thread(Path(storage_path).unlink, missing_ok=True)
             raise
 
-        try:
-            async with perception_slots:
-                extracted, asset_status = await asyncio.to_thread(
-                    app.state.perception.extract, storage_path, kind, content_type
+        async def settle_asset() -> dict[str, Any]:
+            try:
+                async with perception_slots:
+                    extracted, asset_status = await asyncio.to_thread(
+                        app.state.perception.extract, storage_path, kind, content_type
+                    )
+                note = (
+                    '已读取'
+                    if asset_status == 'ready'
+                    else '已保存，等待本地感知服务'
+                    if asset_status == 'pending'
+                    else '解析失败'
                 )
-            note = (
-                '已读取'
-                if asset_status == 'ready'
-                else '已保存，等待本地感知服务'
-                if asset_status == 'pending'
-                else '解析失败'
-            )
-            await asyncio.to_thread(
-                app.state.store.update_asset,
-                asset.id,
-                asset_status,
-                extracted,
-                '' if asset_status != 'error' else 'perception_failed',
-                note,
-            )
-        except Exception:
-            await asyncio.to_thread(
-                app.state.store.update_asset,
-                asset.id,
-                'error',
-                '',
-                'perception_failed',
-                '解析失败，可重新上传或检查本地感知服务',
-            )
-        public_asset = await asyncio.to_thread(app.state.store.get_asset, asset.id, False)
+                await asyncio.to_thread(
+                    app.state.store.update_asset,
+                    asset.id,
+                    asset_status,
+                    extracted,
+                    '' if asset_status != 'error' else 'perception_failed',
+                    note,
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    app.state.store.update_asset,
+                    asset.id,
+                    'error',
+                    '',
+                    'perception_failed',
+                    '解析失败，可重新上传或检查本地感知服务',
+                )
+            return await asyncio.to_thread(app.state.store.get_asset, asset.id, False)
+
+        settlement = asyncio.create_task(settle_asset(), name=f'guanchao-asset-{asset.id}')
+        public_asset = await _await_durable_task(settlement)
         return JSONResponse(content=public_asset)
 
     @app.middleware('http')
