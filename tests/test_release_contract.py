@@ -122,9 +122,13 @@ def test_readme_uses_portable_markdown_images_and_self_evolution_math():
     ]:
         assert formula_token in text
 
-    assert "0.004" not in text
-    assert "-0.015" not in text
-    assert "challenge_confidence" not in text
+    policy_source = Path("guanchao/policy.py").read_text(encoding="utf-8")
+    evolution_source = Path("guanchao/evolution.py").read_text(encoding="utf-8")
+    assert "challenge_confidence" not in policy_source
+    assert "stability_confidence" not in policy_source
+    assert "verdict_evidence_floor" not in policy_source
+    assert "0.004" not in evolution_source
+    assert "-0.015" not in evolution_source
 
     for flow_token in ["▼", "→", "├─", "└─"]:
         assert flow_token not in text
