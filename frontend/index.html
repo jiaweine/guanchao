@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#efede8" />
+  <title>观潮 · 内容可信度工作台</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="观潮首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>观潮</strong><small>内容可信度工作台</small></span>
+      </a>
+      <div class="top-center"><span class="status-dot"></span><span>本地工作空间</span></div>
+      <nav class="top-actions" aria-label="工作区操作">
+        <button class="text-btn" id="demoBtn">载入演示</button>
+        <button class="pill-btn" id="newCaseBtn">新建调查</button>
+      </nav>
+    </header>
+
+    <aside class="rail">
+      <div class="rail-intro">
+        <span class="kicker">INVESTIGATIONS</span>
+        <h2>把“像不像营销号”变成一条可复核的证据链。</h2>
+      </div>
+      <button class="new-investigation" id="newCaseRailBtn"><span>＋</span>新建调查</button>
+      <div class="rail-section">
+        <div class="section-label"><span>最近调查</span><button id="refreshCases" aria-label="刷新">↻</button></div>
+        <div class="case-list" id="caseList">
+          <div class="case-empty">还没有任务。可以直接载入演示。</div>
+        </div>
+      </div>
+      <div class="rail-footer">
+        <div><span class="status-dot"></span><span>服务可用</span></div>
+        <small>判断来自当前资料，可随复核持续校准。</small>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <section class="workspace-head">
+        <div>
+          <span class="eyebrow" id="casePlatform">跨平台调查</span>
+          <h1 id="caseTitle">今天想核查哪个账号？</h1>
+          <p id="caseMeta">给我账号资料和你的目标，我会自己决定先查什么，再把判断和证据一起交给你。</p>
+        </div>
+        <div class="workspace-actions" id="workspaceActions" hidden>
+          <button class="quiet-btn" id="markNormalBtn">复核为普通创作者</button>
+          <button class="quiet-btn warn" id="markMarketingBtn">复核为营销运营</button>
+        </div>
+      </section>
+
+      <section class="conversation" id="conversation">
+        <div class="welcome" id="welcome">
+          <div class="hero-line">
+            <span class="hero-index">01</span>
+            <div class="hero-rule"></div>
+            <span>目标驱动</span>
+          </div>
+          <h2>不用先选“检测模式”。<br><em>直接说你想知道什么。</em></h2>
+          <p>观潮会围绕同一个任务持续推进：读资料、找线索、做反向核查、补证、形成判断。资料不够时，它会明确告诉你缺什么，而不是硬给结论。</p>
+          <div class="starter-grid">
+            <button data-demo="1" class="starter starter-featured">
+              <span class="starter-no">A</span>
+              <strong>这个小红书账号是不是长期营销运营？</strong>
+              <small>自动检查主页、近期内容、重复模式和发布节奏</small>
+              <i>载入完整演示 →</i>
+            </button>
+            <button class="starter" data-open="new">
+              <span class="starter-no">B</span>
+              <strong>我有一批账号，先帮我筛出最值得复核的</strong>
+              <small>适合运营、舆情与内容治理团队</small>
+            </button>
+            <button class="starter" data-open="new">
+              <span class="starter-no">C</span>
+              <strong>这个账号看起来很商业，但我怕误判</strong>
+              <small>会主动寻找与当前判断相反的证据</small>
+            </button>
+          </div>
+        </div>
+        <div class="message-list" id="messageList"></div>
+        <div class="run-strip" id="runStrip" hidden>
+          <div class="run-live"><span></span><b id="runTitle">正在核查</b><small id="runDetail">准备资料</small></div>
+          <div class="run-progress"><i id="runProgress"></i></div>
+        </div>
+      </section>
+
+      <section class="composer-wrap">
+        <div class="composer">
+          <textarea id="messageInput" rows="1" placeholder="例如：不要只看一条内容，帮我判断这个账号是不是长期营销运营，并告诉我为什么。"></textarea>
+          <div class="composer-meta">
+            <span id="composerHint">Enter 发送 · Shift+Enter 换行</span>
+            <button class="send-btn" id="sendBtn" aria-label="发送">↗</button>
+          </div>
+        </div>
+        <p class="fineprint">结果用于辅助内容研判，不应替代平台规则、合同事实或人工最终处置。</p>
+      </section>
+    </main>
+
+    <aside class="evidence-rail">
+      <div class="evidence-tabs" role="tablist">
+        <button class="active" data-tab="summary">判断</button>
+        <button data-tab="evidence">证据</button>
+        <button data-tab="trace">过程</button>
+      </div>
+      <div class="evidence-scroll">
+        <section class="tab-panel active" id="tab-summary">
+          <div class="empty-insight" id="summaryEmpty">
+            <span class="empty-orbit"></span>
+            <strong>还没有判断</strong>
+            <p>开始调查后，这里只保留你真正需要看的结论、把握度和待补资料。</p>
+          </div>
+          <div id="summaryContent" hidden>
+            <div class="verdict-block">
+              <span class="mini-label">当前判断</span>
+              <h3 id="verdictLabel">—</h3>
+              <div class="confidence-row"><span>把握度</span><strong id="confidenceValue">0%</strong></div>
+              <div class="meter"><i id="confidenceMeter"></i></div>
+            </div>
+            <div class="signal-pair">
+              <div><span>营销倾向</span><strong id="marketingValue">—</strong></div>
+              <div><span>隐性推广风险</span><strong id="covertValue">—</strong></div>
+            </div>
+            <div class="summary-copy" id="summaryCopy"></div>
+            <div class="missing-block" id="missingBlock" hidden>
+              <span class="mini-label">如果要更稳</span>
+              <ul id="missingList"></ul>
+            </div>
+          </div>
+        </section>
+        <section class="tab-panel" id="tab-evidence">
+          <div class="evidence-list" id="evidenceList"><div class="side-empty">完成一次调查后显示关键证据。</div></div>
+        </section>
+        <section class="tab-panel" id="tab-trace">
+          <div class="trace-list" id="traceList"><div class="side-empty">执行过程会按时间留下记录。</div></div>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <div class="modal-backdrop" id="caseModal" hidden>
+    <div class="modal">
+      <div class="modal-top">
+        <div><span class="eyebrow">NEW INVESTIGATION</span><h3>新建调查</h3><p>先给最少的资料也可以，之后还能继续补。</p></div>
+        <button class="modal-close" id="closeModal" aria-label="关闭">×</button>
+      </div>
+      <form id="caseForm">
+        <div class="form-row two">
+          <label><span>平台</span><select id="platformInput"><option value="xiaohongshu">小红书</option><option value="weibo">微博</option><option value="douyin">抖音</option><option value="bilibili">B站</option><option value="other">其他</option></select></label>
+          <label><span>账号名</span><input id="handleInput" placeholder="例如：orange_daily_lab" required /></label>
+        </div>
+        <label><span>主页简介 <em>可选</em></span><input id="bioInput" placeholder="把主页简介贴进来" /></label>
+        <label><span>近期内容</span><textarea id="postsInput" rows="7" placeholder="一行一条，建议至少 3 条；也可以先填少量内容再继续补充。" required></textarea></label>
+        <label><span>你想知道什么</span><textarea id="goalInput" rows="3" placeholder="例如：判断这个账号是不是长期营销运营，尤其注意有没有批量化内容和导流。" required></textarea></label>
+        <div class="modal-actions"><button type="button" class="quiet-btn" id="cancelModal">取消</button><button type="submit" class="pill-btn">开始调查</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

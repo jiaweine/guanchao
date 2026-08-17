@@ -1,0 +1,33 @@
+<svg width="1440" height="840" viewBox="0 0 1440 840" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="1440" height="840" fill="#EFede8"/>
+<rect x="0.5" y="0.5" width="1439" height="839" stroke="#D8D5CD"/>
+<path d="M0 68H1440M260 0V840M1100 68V840" stroke="#D8D5CD"/>
+<rect x="260" y="68" width="840" height="772" fill="#F8F6F1"/>
+<rect x="1100" y="68" width="340" height="772" fill="#F3F1EB"/>
+<g font-family="system-ui, -apple-system, sans-serif" fill="#1C211F">
+  <text x="26" y="42" font-size="25" font-weight="700">观潮</text>
+  <text x="91" y="41" font-size="12" fill="#6F756F">内容可信度工作台</text>
+  <circle cx="704" cy="34" r="4" fill="#506E5E"/><text x="716" y="39" font-size="12" fill="#6F756F">本地工作空间</text>
+  <text x="1235" y="40" font-size="12" fill="#6F756F">载入演示</text><rect x="1320" y="14" width="94" height="40" rx="20" fill="#1C211F"/><text x="1342" y="39" font-size="13" fill="#FFF">新建调查</text>
+  <text x="24" y="112" font-size="10" font-weight="700" letter-spacing="2" fill="#6F756F">INVESTIGATIONS</text>
+  <text x="24" y="148" font-size="17" font-weight="600">把“像不像营销号”变成一条</text><text x="24" y="172" font-size="17" font-weight="600">可复核的证据链。</text>
+  <rect x="18" y="198" width="222" height="56" rx="12" fill="#1C211F"/><text x="37" y="233" font-size="16" fill="#FFF">＋  新建调查</text>
+  <text x="24" y="295" font-size="11" fill="#6F756F">最近调查</text>
+  <rect x="18" y="312" width="222" height="60" rx="12" fill="#FFFDF8"/><circle cx="31" cy="334" r="4" fill="#C85B39"/><text x="43" y="337" font-size="12" font-weight="650">橙子生活研究所 · 营销倾向复核</text><text x="43" y="357" font-size="10" fill="#6F756F">小红书 · 刚刚</text>
+  <text x="294" y="108" font-size="10" font-weight="700" letter-spacing="1.8" fill="#6F756F">小红书 · 橙子生活研究所</text>
+  <text x="294" y="147" font-size="27" font-weight="700">橙子生活研究所 · 营销倾向复核</text>
+  <text x="294" y="175" font-size="12" fill="#6F756F">不要只看一条内容，判断这个账号是不是长期营销运营，并告诉我为什么。</text>
+  <path d="M260 204H1100" stroke="#D8D5CD"/>
+  <text x="294" y="258" font-size="10" fill="#6F756F">YOU</text><text x="380" y="259" font-size="16">不要只看一条内容，帮我判断这个账号是不是长期营销运营，并告诉我为什么。</text>
+  <path d="M380 286H1065" stroke="#D8D5CD"/>
+  <text x="294" y="320" font-size="10" fill="#6F756F">观潮</text>
+  <text x="380" y="320" font-size="14">当前判断为“高度营销化”，把握度约 93%。主要依据是行动引导明显、商业表达集中；</text><text x="380" y="345" font-size="14">同时已检查反向线索与资料缺口。</text>
+  <rect x="294" y="690" width="771" height="112" fill="#FFFDF8" stroke="#BCB8AE"/><text x="310" y="724" font-size="13" fill="#6F756F">例如：不要只看一条内容，帮我判断这个账号是不是长期营销运营，并告诉我为什么。</text><circle cx="1033" cy="771" r="18" fill="#1C211F"/><text x="1026" y="777" font-size="16" fill="#FFF">↗</text>
+  <text x="1123" y="105" font-size="11">判断</text><text x="1186" y="105" font-size="11" fill="#6F756F">证据</text><text x="1245" y="105" font-size="11" fill="#6F756F">过程</text><path d="M1122 121H1155" stroke="#C85B39" stroke-width="2"/>
+  <text x="1123" y="164" font-size="10" font-weight="700" letter-spacing="1.4" fill="#6F756F">当前判断</text><text x="1123" y="215" font-size="35" font-weight="700">高度营销化</text>
+  <text x="1123" y="257" font-size="10" fill="#6F756F">把握度</text><text x="1392" y="257" font-size="11" font-weight="700">93%</text><rect x="1123" y="269" width="294" height="5" fill="#DDD9D0"/><rect x="1123" y="269" width="273" height="5" fill="#C85B39"/>
+  <path d="M1123 298H1417M1271 298V380" stroke="#D8D5CD"/><text x="1123" y="327" font-size="10" fill="#6F756F">营销倾向</text><text x="1123" y="359" font-size="21" font-weight="700">86%</text><text x="1288" y="327" font-size="10" fill="#6F756F">隐性推广风险</text><text x="1288" y="359" font-size="21" font-weight="700">76%</text>
+  <path d="M1123 402H1417" stroke="#D8D5CD"/><text x="1123" y="434" font-size="12" fill="#434943">多条近期内容持续出现购买引导、优惠表达和</text><text x="1123" y="456" font-size="12" fill="#434943">固定转化句式，主页也存在合作与导流信息。</text>
+  <path d="M1123 482H1417" stroke="#D8D5CD"/><text x="1123" y="514" font-size="10" font-weight="700" letter-spacing="1.4" fill="#6F756F">如果要更稳</text><circle cx="1128" cy="544" r="2" fill="#6F756F"/><text x="1140" y="548" font-size="11" fill="#6F756F">更多历史内容可用于观察长期稳定性</text>
+</g>
+</svg>
