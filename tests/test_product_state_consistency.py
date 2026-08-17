@@ -10,19 +10,19 @@ from guanchao.api import create_app
 from guanchao.harness import RunCapacityError
 
 
+def _target(handle: str) -> dict:
+    return {
+        'platform': 'weibo',
+        'handle': handle,
+        'bio': '生活记录',
+        'posts': [{'text': '今天散步'}, {'text': '周末做饭'}],
+    }
+
+
 def _case(client: TestClient):
     response = client.post(
         '/api/cases',
-        json={
-            'title': '状态一致性',
-            'goal': '核查账号',
-            'targets': [{
-                'platform': 'weibo',
-                'handle': 'state-check',
-                'bio': '生活记录',
-                'posts': [{'text': '今天散步'}, {'text': '周末做饭'}],
-            }],
-        },
+        json={'title': '状态一致性', 'goal': '核查账号', 'targets': [_target('state-check')]},
     )
     assert response.status_code == 200
     return response.json()
@@ -184,3 +184,47 @@ def test_case_mutation_lock_prevents_asset_and_run_start_from_crossing_snapshots
             assert asset_entered.is_set()
 
     asyncio.run(scenario())
+
+
+def test_case_creation_is_idempotent_for_same_actor_and_request_key(tmp_path):
+    client = TestClient(create_app(str(tmp_path / 'db.sqlite')))
+    payload = {'title': '幂等建案', 'goal': '核查', 'targets': [_target('idem-one')]}
+    headers = {'X-Guanchao-Request-Key': 'case-retry-1'}
+
+    first = client.post('/api/cases', headers=headers, json=payload)
+    second = client.post('/api/cases', headers=headers, json=payload)
+    assert first.status_code == second.status_code == 200
+    assert first.json()['id'] == second.json()['id']
+    cases = client.get('/api/cases?status=all').json()
+    assert len(cases) == 1
+
+
+def test_batch_creation_retry_replays_same_batch_instead_of_duplicating_cases(tmp_path):
+    client = TestClient(create_app(str(tmp_path / 'db.sqlite')))
+    payload = {
+        'title': '幂等批次',
+        'goal': '批量核查',
+        'targets': [_target('idem-a'), _target('idem-b')],
+        'auto_start': False,
+    }
+    headers = {'X-Guanchao-Request-Key': 'batch-retry-1'}
+
+    first = client.post('/api/cases/batch', headers=headers, json=payload)
+    second = client.post('/api/cases/batch', headers=headers, json=payload)
+    assert first.status_code == second.status_code == 200
+    first_data, second_data = first.json(), second.json()
+    assert first_data['batch']['id'] == second_data['batch']['id']
+    assert [item['id'] for item in first_data['cases']] == [item['id'] for item in second_data['cases']]
+    assert len(client.get('/api/cases?status=all').json()) == 2
+
+
+def test_idempotency_key_is_namespaced_by_trusted_actor(tmp_path, monkeypatch):
+    monkeypatch.setenv('GUANCHAO_TRUST_ACTOR_HEADER', '1')
+    client = TestClient(create_app(str(tmp_path / 'db.sqlite')))
+    assert client.post('/api/members', json={'id': 'alice', 'display_name': 'Alice', 'role': 'analyst'}).status_code == 200
+    payload = {'title': '不同成员', 'goal': '核查', 'targets': [_target('actor-key')]}
+    key = {'X-Guanchao-Request-Key': 'shared-client-key'}
+    local = client.post('/api/cases', headers=key, json=payload)
+    alice = client.post('/api/cases', headers={**key, 'X-Guanchao-Actor': 'alice'}, json=payload)
+    assert local.status_code == alice.status_code == 200
+    assert local.json()['id'] != alice.json()['id']

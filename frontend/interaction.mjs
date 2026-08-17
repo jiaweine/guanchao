@@ -2,6 +2,7 @@ import { caseIdFromRequest, isCaseDetailRequest, requestMeta } from './runtime.m
 
 const KIND_NAMES = { image: '图片', video: '视频', audio: '音频', document: '文档', other: '素材' };
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
+const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
 
 export function assetDeletePath(caseId, assetId) {
   return `/api/cases/${encodeURIComponent(caseId)}/assets/${encodeURIComponent(assetId)}`;
@@ -40,16 +41,45 @@ export function shouldDiscardCaseBoundResult(meta, selectedCaseId) {
   return Boolean(isCaseReportRequest(meta) && requestCaseId && selectedCaseId && requestCaseId !== selectedCaseId);
 }
 
+export function uploadSignature(file) {
+  if (!file) return '';
+  return `${file.name || 'asset'}:${Number(file.size) || 0}:${Number(file.lastModified) || 0}`;
+}
+
 function isCaseSnapshotRequest(meta) {
   if (isCaseDetailRequest(meta)) return true;
   return meta.method === 'PATCH' && /^\/api\/cases\/[^/]+(?:\/target)?$/.test(meta.url.pathname);
 }
 
+function isCreateCaseRequest(meta) {
+  return meta.method === 'POST' && meta.url.pathname === '/api/cases';
+}
+
+function isCreateBatchRequest(meta) {
+  return meta.method === 'POST' && meta.url.pathname === '/api/cases/batch';
+}
+
+function isAssetUploadRequest(meta) {
+  return meta.method === 'POST' && /^\/api\/cases\/[^/]+\/assets$/.test(meta.url.pathname);
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
+}
+
 function staleResultResponse(caseId) {
-  return new Response(
-    JSON.stringify({ detail: `已切换到另一调查，已取消原调查 ${caseId} 的结果交付。` }),
-    { status: 409, headers: { 'content-type': 'application/json; charset=utf-8' } },
-  );
+  return jsonResponse({ detail: `已切换到另一调查，已取消原调查 ${caseId} 的结果交付。` }, 409);
+}
+
+function withHeader(init, name, value) {
+  const headers = new Headers(init.headers || {});
+  headers.set(name, value);
+  return { ...init, headers };
+}
+
+function newRequestKey(windowRef, prefix) {
+  const id = windowRef.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}-${id}`;
 }
 
 function notify(documentRef, message) {
@@ -261,6 +291,36 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
   installUploadPreflight(documentRef);
 
   let selectedSnapshot = null;
+  let createFlow = { key: '', payload: '', caseId: null, assetFlights: new Map(), recoveryScheduled: false };
+  let batchFlow = { key: '', payload: '' };
+
+  const resetCreateFlow = () => {
+    createFlow = { key: '', payload: '', caseId: null, assetFlights: new Map(), recoveryScheduled: false };
+  };
+  const resetBatchFlow = () => {
+    batchFlow = { key: '', payload: '' };
+  };
+  const schedulePartialCreateRecovery = (detail) => {
+    if (!createFlow.caseId || createFlow.recoveryScheduled) return;
+    createFlow.recoveryScheduled = true;
+    notify(documentRef, detail);
+    const caseId = createFlow.caseId;
+    setTimeout(() => {
+      const url = new URL(windowRef.location.href);
+      url.searchParams.set('case', caseId);
+      windowRef.location.assign(url.toString());
+    }, 650);
+  };
+
+  if (typeof windowRef.MutationObserver === 'function') {
+    const batchModal = documentRef.querySelector?.('#batchModal');
+    if (batchModal) {
+      new windowRef.MutationObserver(() => {
+        if (batchModal.hidden) resetBatchFlow();
+      }).observe(batchModal, { attributes: true, attributeFilter: ['hidden'] });
+    }
+  }
+
   const assetList = documentRef.querySelector?.('#assetList');
   if (assetList && typeof windowRef.MutationObserver === 'function') {
     const observer = new windowRef.MutationObserver(() => {
@@ -276,7 +336,73 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
   const guardedFetch = windowRef.fetch.bind(windowRef);
   windowRef.fetch = async (input, init = {}) => {
     const meta = requestMeta(input, init, windowRef.location.href);
-    const response = await guardedFetch(input, init);
+    let effectiveInit = init;
+
+    if (isCreateCaseRequest(meta)) {
+      const payload = typeof meta.body === 'string' ? meta.body : '';
+      if (createFlow.caseId && createFlow.payload && createFlow.payload !== payload) {
+        const detail = '上一条调查已经创建，但素材尚未完整加入；正在打开已创建调查，请在其中继续补充。';
+        schedulePartialCreateRecovery(detail);
+        return jsonResponse({ detail }, 409);
+      }
+      if (!createFlow.key || createFlow.payload !== payload) {
+        createFlow.key = newRequestKey(windowRef, 'case');
+        createFlow.payload = payload;
+      }
+      effectiveInit = withHeader(effectiveInit, 'X-Guanchao-Request-Key', createFlow.key);
+    } else if (isCreateBatchRequest(meta)) {
+      const payload = typeof meta.body === 'string' ? meta.body : '';
+      if (!batchFlow.key || batchFlow.payload !== payload) {
+        batchFlow = { key: newRequestKey(windowRef, 'batch'), payload };
+      }
+      effectiveInit = withHeader(effectiveInit, 'X-Guanchao-Request-Key', batchFlow.key);
+    }
+
+    const assetCaseId = caseIdFromRequest(meta);
+    const creatingAsset = Boolean(isAssetUploadRequest(meta) && createFlow.caseId && assetCaseId === createFlow.caseId);
+    let assetKey = '';
+    if (creatingAsset) {
+      effectiveInit = withHeader(effectiveInit, 'X-Guanchao-Case-Transition', createFlow.caseId);
+      const file = typeof FormData !== 'undefined' && meta.body instanceof FormData ? meta.body.get('file') : null;
+      assetKey = uploadSignature(file);
+    }
+
+    let response;
+    try {
+      if (creatingAsset && assetKey) {
+        let shared = createFlow.assetFlights.get(assetKey);
+        if (!shared) {
+          shared = guardedFetch(input, effectiveInit).then((item) => item.clone());
+          createFlow.assetFlights.set(assetKey, shared);
+        }
+        response = (await shared).clone();
+        if (!response.ok) createFlow.assetFlights.delete(assetKey);
+      } else {
+        response = await guardedFetch(input, effectiveInit);
+      }
+    } catch (error) {
+      if (creatingAsset && createFlow.caseId) {
+        const detail = '调查已创建，但有素材未完整加入；正在打开已创建调查，请重新添加失败素材。';
+        schedulePartialCreateRecovery(detail);
+        throw new Error(detail);
+      }
+      throw error;
+    }
+
+    if (isCreateCaseRequest(meta)) {
+      if (!response.ok) {
+        if (!createFlow.caseId) createFlow.key = '';
+      } else {
+        const created = await response.clone().json().catch(() => ({}));
+        if (created?.id) createFlow.caseId = created.id;
+      }
+    }
+
+    if (creatingAsset && !response.ok) {
+      const detail = '调查已创建，但有素材未完整加入；正在打开已创建调查，请重新添加失败素材。';
+      schedulePartialCreateRecovery(detail);
+      return jsonResponse({ detail }, 409);
+    }
 
     if (shouldDiscardCaseBoundResult(meta, selectedSnapshot?.id) && response.ok) {
       return staleResultResponse(caseIdFromRequest(meta));
@@ -287,6 +413,7 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
         const snapshot = payload?.case || payload;
         if (!snapshot?.id || snapshot.id === '__stale_case_request__') return;
         selectedSnapshot = snapshot;
+        if (createFlow.caseId === snapshot.id) resetCreateFlow();
         queueMicrotask(() => syncAssetDeleteActions(windowRef, documentRef, snapshot));
       }).catch(() => {});
     }

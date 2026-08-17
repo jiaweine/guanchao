@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import weakref
+from collections import OrderedDict
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .api_core import create_app as create_core_app
+
+IDEMPOTENCY_TTL_SECONDS = 600.0
+IDEMPOTENCY_CACHE_LIMIT = 256
 
 
 def _case_id_from_path(path: str) -> str | None:
@@ -18,13 +23,16 @@ def _case_id_from_path(path: str) -> str | None:
     return parts[2]
 
 
-def _request_member(app: FastAPI, request: Request) -> dict[str, Any] | None:
+def _actor_identity(request: Request) -> str:
     trust_actor_header = os.getenv('GUANCHAO_TRUST_ACTOR_HEADER', '0').strip().lower() in {'1', 'true', 'yes'}
-    member_id = 'local'
     if trust_actor_header:
-        member_id = (request.headers.get('X-Guanchao-Actor') or 'local').strip()[:64]
+        return (request.headers.get('X-Guanchao-Actor') or 'local').strip()[:64]
+    return 'local'
+
+
+def _request_member(app: FastAPI, request: Request) -> dict[str, Any] | None:
     try:
-        return app.state.store.get_member(member_id)
+        return app.state.store.get_member(_actor_identity(request))
     except KeyError:
         return None
 
@@ -37,9 +45,31 @@ def _serialize_case_mutation(path: str, method: str, case_id: str | None) -> boo
     return True
 
 
+def _idempotency_scope(request: Request) -> str | None:
+    if request.method.upper() != 'POST' or request.url.path not in {'/api/cases', '/api/cases/batch'}:
+        return None
+    key = (request.headers.get('X-Guanchao-Request-Key') or '').strip()[:160]
+    if not key:
+        return None
+    return f"{_actor_identity(request)}:{request.url.path}:{key}"
+
+
+def _response_from_record(record: tuple[int, dict[str, str], bytes]) -> Response:
+    status, headers, body = record
+    return Response(content=body, status_code=status, headers=headers)
+
+
+async def _record_response(response: Response) -> tuple[int, dict[str, str], bytes]:
+    body = b''.join([chunk async for chunk in response.body_iterator])
+    return response.status_code, dict(response.headers), body
+
+
 def create_app(db_path: str | None = None) -> FastAPI:
     app = create_core_app(db_path)
     case_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+    idempotency_guard = asyncio.Lock()
+    idempotency_cache: OrderedDict[str, tuple[float, tuple[int, dict[str, str], bytes]]] = OrderedDict()
+    idempotency_inflight: dict[str, asyncio.Future[tuple[int, dict[str, str], bytes] | None]] = {}
 
     def lock_for(case_id: str) -> asyncio.Lock:
         lock = case_locks.get(case_id)
@@ -47,6 +77,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
             lock = asyncio.Lock()
             case_locks[case_id] = lock
         return lock
+
+    def prune_idempotency_cache(now: float) -> None:
+        expired = [key for key, (created, _) in idempotency_cache.items() if now - created > IDEMPOTENCY_TTL_SECONDS]
+        for key in expired:
+            idempotency_cache.pop(key, None)
+        while len(idempotency_cache) > IDEMPOTENCY_CACHE_LIMIT:
+            idempotency_cache.popitem(last=False)
+
+    async def idempotent_call(scope: str, action: Any) -> Response:
+        while True:
+            owner = False
+            async with idempotency_guard:
+                now = time.monotonic()
+                prune_idempotency_cache(now)
+                cached = idempotency_cache.get(scope)
+                if cached:
+                    idempotency_cache.move_to_end(scope)
+                    return _response_from_record(cached[1])
+                future = idempotency_inflight.get(scope)
+                if future is None:
+                    future = asyncio.get_running_loop().create_future()
+                    idempotency_inflight[scope] = future
+                    owner = True
+            if owner:
+                break
+            record = await future
+            if record is not None:
+                return _response_from_record(record)
+
+        try:
+            response = await action()
+            record = await _record_response(response)
+        except BaseException:
+            async with idempotency_guard:
+                waiter = idempotency_inflight.pop(scope, None)
+                if waiter and not waiter.done():
+                    waiter.set_result(None)
+            raise
+
+        async with idempotency_guard:
+            if 200 <= record[0] < 300:
+                idempotency_cache[scope] = (time.monotonic(), record)
+                idempotency_cache.move_to_end(scope)
+                prune_idempotency_cache(time.monotonic())
+            waiter = idempotency_inflight.pop(scope, None)
+            if waiter and not waiter.done():
+                waiter.set_result(record)
+        return _response_from_record(record)
 
     @app.middleware('http')
     async def enforce_product_state_consistency(request: Request, call_next: Any):
@@ -98,9 +176,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 )
             return response
 
-        if _serialize_case_mutation(path, method, case_id):
-            async with lock_for(case_id):
-                return await dispatch()
-        return await dispatch()
+        async def serialized_dispatch():
+            if _serialize_case_mutation(path, method, case_id):
+                async with lock_for(case_id):
+                    return await dispatch()
+            return await dispatch()
+
+        scope = _idempotency_scope(request)
+        if scope:
+            await request.body()
+            return await idempotent_call(scope, serialized_dispatch)
+        return await serialized_dispatch()
 
     return app

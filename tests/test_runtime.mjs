@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  allowsCaseTransition,
   caseIdFromRequest,
   createGuardedFetch,
   currentCaseIdFromHref,
@@ -14,6 +15,7 @@ import {
   isCaseReportRequest,
   removeAssetFromSnapshot,
   shouldDiscardCaseBoundResult,
+  uploadSignature,
   validateUploadSelection,
 } from '../frontend/interaction.mjs';
 
@@ -54,6 +56,21 @@ test('successful stale write cannot mutate the newly opened case UI', async () =
   const guardedResponse = await write;
   assert.equal(guardedResponse.status, 409);
   assert.match((await guardedResponse.json()).detail, /原调查/);
+});
+
+test('explicit create transition allows new-case asset writes before selection changes', async () => {
+  const meta = requestMeta('/api/cases/b/assets', { method: 'POST', headers: { 'X-Guanchao-Case-Transition': 'b' } }, 'http://local/?case=a');
+  assert.equal(allowsCaseTransition(meta, 'b'), true);
+  const guarded = createGuardedFetch({
+    nativeFetch: async () => response({ id: 'asset-b' }),
+    getHref: () => 'http://local/?case=a',
+  });
+  const allowed = await guarded('/api/cases/b/assets', {
+    method: 'POST',
+    headers: { 'X-Guanchao-Case-Transition': 'b' },
+  });
+  assert.equal(allowed.status, 200);
+  assert.equal((await allowed.json()).id, 'asset-b');
 });
 
 test('selected case state closes the gap before the browser URL is updated', async () => {
@@ -126,4 +143,5 @@ test('upload preflight rejects empty and oversized files before creating partial
   assert.equal(oversized.ok, false);
   assert.match(oversized.message, /30MB/);
   assert.equal(validateUploadSelection([{ name: 'ok.txt', size: 1024 }]).ok, true);
+  assert.equal(uploadSignature({ name: 'ok.txt', size: 1024, lastModified: 7 }), 'ok.txt:1024:7');
 });

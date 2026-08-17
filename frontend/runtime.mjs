@@ -26,11 +26,24 @@ function caseSelection(getHref) {
   };
 }
 
+function requestHeaders(input, init) {
+  const headers = new Headers(
+    init.headers || (typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined),
+  );
+  return headers;
+}
+
 export function requestMeta(input, init = {}, baseHref = 'http://localhost/') {
   const rawUrl = typeof input === 'string' || input instanceof URL ? input : input.url;
   const url = new URL(rawUrl, baseHref);
   const method = String(init.method || (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET')).toUpperCase();
-  return { url, method, body: init.body };
+  const headers = requestHeaders(input, init);
+  return {
+    url,
+    method,
+    body: init.body,
+    transitionCaseId: (headers.get('X-Guanchao-Case-Transition') || '').trim(),
+  };
 }
 
 export function caseIdFromRequest(meta) {
@@ -59,6 +72,10 @@ export function isSensitiveCaseWrite(meta) {
   const caseId = caseIdFromRequest(meta);
   if (!caseId || ['GET', 'HEAD', 'OPTIONS'].includes(meta.method)) return false;
   return meta.url.pathname !== '/api/events';
+}
+
+export function allowsCaseTransition(meta, caseId) {
+  return Boolean(caseId && meta.transitionCaseId && meta.transitionCaseId === caseId);
 }
 
 function jsonResponse(data, status = 200) {
@@ -175,7 +192,7 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
 
       if (draft && !response.ok && !moved) restoreDraft(documentRef, draft);
 
-      if (isSensitiveCaseWrite(meta) && response.ok && moved) {
+      if (isSensitiveCaseWrite(meta) && response.ok && moved && !allowsCaseTransition(meta, caseId)) {
         return staleWriteResponse(caseId);
       }
 
