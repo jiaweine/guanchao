@@ -4,9 +4,15 @@ from dataclasses import dataclass, field
 
 from .detection_support import _clip_range
 
+
 @dataclass(slots=True)
 class Calibration:
-    """Learnable verdict parameters; domain extraction rules stay deterministic."""
+    """Learnable verdict parameters with a cold-start prior.
+
+    The defaults only provide an initial operating point. Once decisive review
+    data exists, the Harness can promote data-adaptive candidates through the
+    replay gate; they are not immutable business rules.
+    """
 
     bias: float = -0.70
     weights: dict[str, float] = field(default_factory=lambda: {
@@ -69,11 +75,11 @@ class Calibration:
             for key in interactions:
                 if key in incoming_interactions:
                     interactions[key] = float(incoming_interactions[key])
-        temperature = _clip_range(float(raw.get("temperature", base.temperature)), 0.55, 1.8)
-        semantic_weight = _clip_range(float(raw.get("semantic_weight", base.semantic_weight)), 0.0, 0.8)
-        decision_threshold = _clip_range(float(raw.get("decision_threshold", base.decision_threshold)), 0.32, 0.68)
-        abstain_margin = _clip_range(float(raw.get("abstain_margin", base.abstain_margin)), 0.03, 0.18)
-        high_threshold = _clip_range(float(raw.get("high_threshold", base.high_threshold)), decision_threshold + 0.10, 0.95)
+        temperature = _clip_range(float(raw.get("temperature", base.temperature)), 0.1, 10.0)
+        semantic_weight = _clip_range(float(raw.get("semantic_weight", base.semantic_weight)), 0.0, 1.0)
+        decision_threshold = _clip_range(float(raw.get("decision_threshold", base.decision_threshold)), 0.01, 0.99)
+        abstain_margin = _clip_range(float(raw.get("abstain_margin", base.abstain_margin)), 0.0, 0.49)
+        high_threshold = _clip_range(float(raw.get("high_threshold", base.high_threshold)), decision_threshold, 1.0)
         return cls(
             bias=bias,
             weights=weights,
@@ -84,4 +90,3 @@ class Calibration:
             abstain_margin=abstain_margin,
             high_threshold=high_threshold,
         )
-
