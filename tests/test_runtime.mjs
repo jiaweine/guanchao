@@ -14,6 +14,7 @@ import {
   isCaseReportRequest,
   removeAssetFromSnapshot,
   shouldDiscardCaseBoundResult,
+  validateUploadSelection,
 } from '../frontend/interaction.mjs';
 
 const response = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
@@ -116,4 +117,13 @@ test('case-bound report result is discarded after switching to another investiga
   assert.equal(shouldDiscardCaseBoundResult(report, 'b'), true);
   const ordinaryRead = requestMeta('/api/cases/a', {}, 'http://local/?case=b');
   assert.equal(shouldDiscardCaseBoundResult(ordinaryRead, 'b'), false);
+});
+
+test('upload preflight rejects empty and oversized files before creating partial workflows', () => {
+  assert.equal(validateUploadSelection([{ name: 'empty.txt', size: 0 }]).ok, false);
+  assert.match(validateUploadSelection([{ name: 'empty.txt', size: 0 }]).message, /空文件/);
+  const oversized = validateUploadSelection([{ name: 'video.mov', size: 30 * 1024 * 1024 + 1 }]);
+  assert.equal(oversized.ok, false);
+  assert.match(oversized.message, /30MB/);
+  assert.equal(validateUploadSelection([{ name: 'ok.txt', size: 1024 }]).ok, true);
 });

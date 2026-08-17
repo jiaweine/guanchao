@@ -1,6 +1,7 @@
 import { caseIdFromRequest, isCaseDetailRequest, requestMeta } from './runtime.mjs';
 
 const KIND_NAMES = { image: '图片', video: '视频', audio: '音频', document: '文档', other: '素材' };
+const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
 
 export function assetDeletePath(caseId, assetId) {
   return `/api/cases/${encodeURIComponent(caseId)}/assets/${encodeURIComponent(assetId)}`;
@@ -21,6 +22,15 @@ export function removeAssetFromSnapshot(snapshot, assetId) {
   return snapshot.assets;
 }
 
+export function validateUploadSelection(files, maxBytes = MAX_UPLOAD_BYTES) {
+  const selected = [...files];
+  const empty = selected.find((file) => !Number(file.size));
+  if (empty) return { ok: false, message: `“${empty.name || '素材'}”是空文件，请重新选择。` };
+  const oversized = selected.find((file) => Number(file.size) > maxBytes);
+  if (oversized) return { ok: false, message: `“${oversized.name || '素材'}”超过 30MB，请压缩或拆分后再上传。` };
+  return { ok: true, message: '' };
+}
+
 export function isCaseReportRequest(meta) {
   return meta.method === 'GET' && /^\/api\/cases\/[^/]+\/report$/.test(meta.url.pathname);
 }
@@ -28,6 +38,11 @@ export function isCaseReportRequest(meta) {
 export function shouldDiscardCaseBoundResult(meta, selectedCaseId) {
   const requestCaseId = caseIdFromRequest(meta);
   return Boolean(isCaseReportRequest(meta) && requestCaseId && selectedCaseId && requestCaseId !== selectedCaseId);
+}
+
+function isCaseSnapshotRequest(meta) {
+  if (isCaseDetailRequest(meta)) return true;
+  return meta.method === 'PATCH' && /^\/api\/cases\/[^/]+(?:\/target)?$/.test(meta.url.pathname);
 }
 
 function staleResultResponse(caseId) {
@@ -53,7 +68,7 @@ function ensureInteractionStyle(documentRef) {
   style.id = 'interactionStyle';
   style.textContent = `
     .asset-top{justify-content:flex-start}.asset-top .asset-state{margin-left:auto}
-    .asset-remove{border:0;background:transparent;color:var(--danger);font-size:8px;padding:3px 0 3px 6px}
+    .asset-remove{border:0;background:transparent;color:var(--danger);font-size:12px;line-height:1;padding:6px 2px 6px 8px;min-height:28px}
     .asset-remove:hover{text-decoration:underline}.asset-remove:disabled{opacity:.45}
   `;
   documentRef.head?.appendChild(style);
@@ -67,7 +82,7 @@ function visibleDialog(documentRef) {
 function dialogFocusables(dialog) {
   if (!dialog) return [];
   return [...dialog.querySelectorAll?.('button:not([disabled]),input:not([disabled]):not([type="hidden"]),textarea:not([disabled]),select:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])') || []]
-    .filter((element) => !element.hidden);
+    .filter((element) => !element.hidden && !element.closest?.('[hidden]'));
 }
 
 function prepareDialogSemantics(documentRef) {
@@ -81,6 +96,8 @@ function prepareDialogSemantics(documentRef) {
     }
   });
 
+  const tabList = documentRef.querySelector?.('.insight-tabs');
+  if (tabList) tabList.setAttribute('role', 'tablist');
   [...documentRef.querySelectorAll?.('.insight-tabs button') || []].forEach((button, index) => {
     const panel = documentRef.querySelector?.(`#tab-${button.dataset.tab}`);
     if (!panel) return;
@@ -90,6 +107,10 @@ function prepareDialogSemantics(documentRef) {
     button.setAttribute('aria-selected', button.classList.contains('active') ? 'true' : 'false');
     panel.setAttribute('role', 'tabpanel');
     panel.setAttribute('aria-labelledby', button.id);
+  });
+
+  [...documentRef.querySelectorAll?.('button[title]') || []].forEach((button) => {
+    if (!button.getAttribute('aria-label')) button.setAttribute('aria-label', button.getAttribute('title'));
   });
 }
 
@@ -101,6 +122,18 @@ function syncTabSelection(documentRef) {
 
 function installModalKeyboard(documentRef) {
   documentRef.addEventListener('keydown', (event) => {
+    const tab = event.target?.closest?.('[role="tab"]');
+    if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+      const tabs = [...documentRef.querySelectorAll?.('.insight-tabs [role="tab"]') || []];
+      const index = tabs.indexOf(tab);
+      if (index >= 0) {
+        event.preventDefault();
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        tabs[next]?.focus?.();
+        tabs[next]?.click?.();
+      }
+      return;
+    }
     if (event.key !== 'Tab') return;
     const dialog = visibleDialog(documentRef);
     if (!dialog) return;
@@ -135,6 +168,29 @@ function installModalInertState(windowRef, documentRef) {
   });
 }
 
+function installUploadPreflight(documentRef) {
+  documentRef.addEventListener('change', (event) => {
+    if (!['assetInput', 'modalAssetInput'].includes(event.target?.id)) return;
+    const result = validateUploadSelection(event.target.files || []);
+    if (result.ok) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    event.target.value = '';
+    notify(documentRef, result.message);
+  }, true);
+
+  documentRef.addEventListener('drop', (event) => {
+    if (!event.dataTransfer?.files?.length) return;
+    const result = validateUploadSelection(event.dataTransfer.files);
+    if (result.ok) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const layer = documentRef.querySelector?.('#dropLayer');
+    if (layer) layer.hidden = true;
+    notify(documentRef, result.message);
+  }, true);
+}
+
 function syncAssetTray(documentRef, assets) {
   const tray = documentRef.querySelector?.('#uploadTray');
   if (!tray) return;
@@ -151,12 +207,15 @@ function syncAssetTray(documentRef, assets) {
   });
 }
 
-function decorateAssetDeleteActions(windowRef, documentRef, snapshot) {
+function syncAssetDeleteActions(windowRef, documentRef, snapshot) {
   const attach = documentRef.querySelector?.('#attachBtn');
   const canDelete = canOfferAssetDelete(snapshot, Boolean(attach && !attach.disabled));
-  if (!canDelete) return;
-  const assets = snapshot.assets || [];
   const rows = [...documentRef.querySelectorAll?.('#assetList .asset-item') || []];
+  if (!canDelete) {
+    rows.forEach((row) => row.querySelector?.('[data-asset-delete]')?.remove());
+    return;
+  }
+  const assets = snapshot.assets || [];
   rows.forEach((row, index) => {
     const asset = assets[index];
     if (!asset?.id || row.querySelector?.('[data-asset-delete]')) return;
@@ -199,12 +258,13 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
   prepareDialogSemantics(documentRef);
   installModalKeyboard(documentRef);
   installModalInertState(windowRef, documentRef);
+  installUploadPreflight(documentRef);
 
   let selectedSnapshot = null;
   const assetList = documentRef.querySelector?.('#assetList');
   if (assetList && typeof windowRef.MutationObserver === 'function') {
     const observer = new windowRef.MutationObserver(() => {
-      if (selectedSnapshot) decorateAssetDeleteActions(windowRef, documentRef, selectedSnapshot);
+      if (selectedSnapshot) syncAssetDeleteActions(windowRef, documentRef, selectedSnapshot);
     });
     observer.observe(assetList, { childList: true, subtree: true });
   }
@@ -222,11 +282,12 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
       return staleResultResponse(caseIdFromRequest(meta));
     }
 
-    if (isCaseDetailRequest(meta) && response.ok) {
-      response.clone().json().then((snapshot) => {
+    if (isCaseSnapshotRequest(meta) && response.ok) {
+      response.clone().json().then((payload) => {
+        const snapshot = payload?.case || payload;
         if (!snapshot?.id || snapshot.id === '__stale_case_request__') return;
         selectedSnapshot = snapshot;
-        queueMicrotask(() => decorateAssetDeleteActions(windowRef, documentRef, snapshot));
+        queueMicrotask(() => syncAssetDeleteActions(windowRef, documentRef, snapshot));
       }).catch(() => {});
     }
     return response;
