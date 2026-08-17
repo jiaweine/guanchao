@@ -93,8 +93,11 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
   let auditSeq = 0;
   let latestAudit = null;
   let reviewSubmitting = false;
+  let activeCaseId = currentCaseIdFromHref(getHref());
 
-  const coordinateRead = async (slot, sequence, networkPromise) => {
+  const currentCaseId = () => activeCaseId || currentCaseIdFromHref(getHref());
+
+  const coordinateRead = async (slot, sequence, networkPromise, fallbackData) => {
     const response = await networkPromise;
     const latest = slot();
     if (sequence === latest?.sequence) return response;
@@ -102,7 +105,7 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
       const replacement = await latest.responsePromise;
       return replacement.clone();
     } catch {
-      return jsonResponse({ id: '__stale_case_request__' });
+      return jsonResponse(fallbackData);
     }
   };
 
@@ -123,13 +126,17 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
       const sequence = ++detailSeq;
       const networkPromise = nativeFetch(input, init);
       latestDetail = { sequence, caseId, responsePromise: networkPromise.then((response) => response.clone()) };
-      const coordinated = await coordinateRead(() => latestDetail, sequence, networkPromise);
-      coordinated.clone().json().then((item) => {
+      const coordinated = await coordinateRead(() => latestDetail, sequence, networkPromise, { id: '__stale_case_request__' });
+      try {
+        const item = await coordinated.clone().json();
         if (item?.id && item.id !== '__stale_case_request__') {
+          activeCaseId = item.id;
           const latest = (item.runs || [])[0];
           onCaseState(item.id, latest?.status === 'running');
         }
-      }).catch(() => {});
+      } catch {
+        // Core API will surface malformed responses; runtime only tracks valid case snapshots.
+      }
       return coordinated;
     }
 
@@ -138,7 +145,7 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
       const auditCaseId = meta.url.searchParams.get('case_id');
       const networkPromise = nativeFetch(input, init);
       latestAudit = { sequence, caseId: auditCaseId, responsePromise: networkPromise.then((response) => response.clone()) };
-      return coordinateRead(() => latestAudit, sequence, networkPromise);
+      return coordinateRead(() => latestAudit, sequence, networkPromise, []);
     }
 
     try {
@@ -149,8 +156,8 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
         }).catch(() => {});
       }
       if (draft && response.ok && caseId) onRunState(caseId, true);
-      const currentCaseId = currentCaseIdFromHref(getHref());
-      const moved = Boolean(caseId && currentCaseId && caseId !== currentCaseId);
+      const selectedCaseId = currentCaseId();
+      const moved = Boolean(caseId && selectedCaseId && caseId !== selectedCaseId);
 
       if (draft && !response.ok && !moved) restoreDraft(documentRef, draft);
 
@@ -167,8 +174,8 @@ export function createGuardedFetch({ nativeFetch, getHref, documentRef = null, o
 
       return response;
     } catch (error) {
-      const currentCaseId = currentCaseIdFromHref(getHref());
-      if (draft && (!caseId || !currentCaseId || caseId === currentCaseId)) restoreDraft(documentRef, draft);
+      const selectedCaseId = currentCaseId();
+      if (draft && (!caseId || !selectedCaseId || caseId === selectedCaseId)) restoreDraft(documentRef, draft);
       throw error;
     } finally {
       if (meta.url.pathname === '/api/reviews' && meta.method === 'POST') {
@@ -184,14 +191,26 @@ export function installRuntimeGuards({ windowRef = window, documentRef = documen
   const nativeFetch = windowRef.fetch.bind(windowRef);
   const runningCases = new Map();
   let reviewBusy = false;
-  const updateRunState = (caseId, running) => {
-    runningCases.set(caseId, Boolean(running));
-    if (!running || currentCaseIdFromHref(windowRef.location.href) !== caseId) return;
+  let activeCaseId = currentCaseIdFromHref(windowRef.location.href);
+  const selectedCaseId = () => activeCaseId || currentCaseIdFromHref(windowRef.location.href);
+
+  const enforceRunningControls = (caseId) => {
+    if (!runningCases.get(caseId) || selectedCaseId() !== caseId) return;
     const send = documentRef.querySelector?.('#sendBtn');
     const attach = documentRef.querySelector?.('#attachBtn');
     if (send) send.disabled = true;
     if (attach) attach.disabled = true;
   };
+
+  const updateRunState = (caseId, running) => {
+    activeCaseId = caseId || activeCaseId;
+    runningCases.set(caseId, Boolean(running));
+    if (!running) return;
+    enforceRunningControls(caseId);
+    queueMicrotask(() => enforceRunningControls(caseId));
+    setTimeout(() => enforceRunningControls(caseId), 0);
+  };
+
   windowRef.fetch = createGuardedFetch({
     nativeFetch,
     getHref: () => windowRef.location.href,
@@ -203,7 +222,7 @@ export function installRuntimeGuards({ windowRef = window, documentRef = documen
 
   let modalReturnFocus = null;
   documentRef.addEventListener('click', (event) => {
-    const currentCase = currentCaseIdFromHref(windowRef.location.href);
+    const currentCase = selectedCaseId();
     const reviewAction = event.target.closest?.('#markNormalBtn,#markUncertainBtn,#markMarketingBtn');
     if (reviewAction && reviewBusy) {
       event.preventDefault();
@@ -224,7 +243,7 @@ export function installRuntimeGuards({ windowRef = window, documentRef = documen
   }, true);
 
   documentRef.addEventListener('keydown', (event) => {
-    const currentCase = currentCaseIdFromHref(windowRef.location.href);
+    const currentCase = selectedCaseId();
     if (reviewBusy && ['1', '2', '3'].includes(event.key) && !['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target?.tagName)) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -248,7 +267,7 @@ export function installRuntimeGuards({ windowRef = window, documentRef = documen
   }, true);
 
   documentRef.addEventListener('drop', (event) => {
-    const currentCase = currentCaseIdFromHref(windowRef.location.href);
+    const currentCase = selectedCaseId();
     if (!currentCase || !runningCases.get(currentCase) || !event.dataTransfer?.files?.length) return;
     event.preventDefault();
     event.stopImmediatePropagation();

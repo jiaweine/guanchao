@@ -46,6 +46,22 @@ test('successful stale write cannot mutate the newly opened case UI', async () =
   assert.match((await guardedResponse.json()).detail, /原调查/);
 });
 
+test('selected case state closes the gap before the browser URL is updated', async () => {
+  const pending = new Map();
+  const nativeFetch = (input, init = {}) => new Promise((resolve) => pending.set(`${init.method || 'GET'} ${String(input)}`, resolve));
+  const guarded = createGuardedFetch({ nativeFetch, getHref: () => 'http://local/?case=a' });
+
+  const write = guarded('/api/cases/a', { method: 'PATCH', body: JSON.stringify({ owner: 'analyst' }) });
+  const openB = guarded('/api/cases/b');
+  pending.get('GET /api/cases/b')(response({ id: 'b', runs: [] }));
+  assert.equal((await (await openB).json()).id, 'b');
+
+  pending.get('PATCH /api/cases/a')(response({ id: 'a' }));
+  const staleWrite = await write;
+  assert.equal(staleWrite.status, 409);
+  assert.match((await staleWrite.json()).detail, /原调查/);
+});
+
 test('failed message request restores the draft instead of losing user text', async () => {
   const input = { value: '', dispatchEvent() {} };
   const documentRef = { querySelector(selector) { return selector === '#messageInput' ? input : null; } };
