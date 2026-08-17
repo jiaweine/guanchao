@@ -8,6 +8,7 @@ import {
   isSensitiveCaseWrite,
   requestMeta,
 } from '../frontend/runtime.mjs';
+import { assetDeletePath, canOfferAssetDelete } from '../frontend/interaction.mjs';
 
 const response = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 
@@ -72,4 +73,13 @@ test('failed message request restores the draft instead of losing user text', as
   });
   await guarded('/api/cases/a/messages', { method: 'POST', body: JSON.stringify({ content: '不要丢掉这段文字' }) });
   assert.equal(input.value, '不要丢掉这段文字');
+});
+
+test('asset management only offers deletion for writable idle cases', () => {
+  const base = { id: 'case a', status: 'active', runs: [{ status: 'completed' }] };
+  assert.equal(canOfferAssetDelete(base, true), true);
+  assert.equal(canOfferAssetDelete({ ...base, status: 'archived' }, true), false);
+  assert.equal(canOfferAssetDelete({ ...base, runs: [{ status: 'running' }] }, true), false);
+  assert.equal(canOfferAssetDelete(base, false), false);
+  assert.equal(assetDeletePath('case a', 'asset/1'), '/api/cases/case%20a/assets/asset%2F1');
 });

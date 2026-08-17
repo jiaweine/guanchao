@@ -3,10 +3,8 @@ from pathlib import Path
 
 
 def frontend_js() -> str:
-    return ''.join(
-        Path(path).read_text(encoding='utf-8')
-        for path in ['frontend/app.js', 'frontend/app-core.js', 'frontend/runtime.mjs']
-    )
+    paths = sorted([*Path('frontend').glob('*.js'), *Path('frontend').glob('*.mjs')])
+    return ''.join(path.read_text(encoding='utf-8') for path in paths)
 
 
 def customer_text() -> str:
@@ -50,6 +48,7 @@ def test_switching_cases_discards_stale_polling_and_case_detail_results():
     assert 'latestDetail' in runtime
     assert 'coordinateRead' in runtime
     assert '__stale_case_request__' in runtime
+    assert 'caseSelection' in runtime
 
 
 def test_review_queue_supports_continuous_keyboard_review_without_double_submit():
@@ -93,3 +92,11 @@ def test_runtime_protects_drafts_stale_writes_and_modal_keyboard_access():
         assert token in runtime
     backend = Path('guanchao/api.py').read_text(encoding='utf-8')
     assert '证据快照' in backend
+
+
+def test_asset_management_and_dialog_accessibility_are_real_interactions():
+    text = Path('frontend/interaction.mjs').read_text(encoding='utf-8')
+    for token in ['assetDeletePath', "method: 'DELETE'", 'aria-modal', "event.key !== 'Tab'", 'shell.inert', 'aria-selected']:
+        assert token in text
+    bootstrap = Path('frontend/app.js').read_text(encoding='utf-8')
+    assert 'installInteractionEnhancements' in bootstrap
