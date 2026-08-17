@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import tempfile
 import time
@@ -252,6 +253,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
         path = request.url.path
         method = request.method.upper()
         case_id = _case_id_from_path(path)
+        review_feedback: dict[str, Any] | None = None
+        if method == 'POST' and path == '/api/reviews':
+            try:
+                raw = json.loads((await request.body()).decode('utf-8'))
+                if isinstance(raw, dict):
+                    review_feedback = raw
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                review_feedback = None
 
         async def dispatch():
             is_target_refresh = bool(case_id and method == 'PATCH' and path.endswith('/target'))
@@ -311,7 +320,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if base:
             body = await request.body()
             digest = hashlib.sha256(body).hexdigest()
-            return await idempotent_call(base, digest, serialized_dispatch)
-        return await serialized_dispatch()
+            response = await idempotent_call(base, digest, serialized_dispatch)
+        else:
+            response = await serialized_dispatch()
+
+        if review_feedback and 200 <= response.status_code < 300:
+            run_id = str(review_feedback.get('run_id') or '')
+            decision = str(review_feedback.get('decision') or '')
+            if run_id and decision in {'confirm_ordinary', 'uncertain', 'confirm_marketing'}:
+                app.state.harness.observe_review(run_id, decision, _actor_identity(request))
+        return response
 
     return app

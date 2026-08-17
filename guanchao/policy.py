@@ -1,23 +1,72 @@
 from __future__ import annotations
 
+import hashlib
 import math
-from dataclasses import asdict, dataclass
+import os
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+_ACTIONS = (
+    "profile.read",
+    "media.inspect",
+    "pattern.compare",
+    "peer.compare",
+    "stability.probe",
+    "evidence.challenge",
+    "verdict.compose",
+)
+_DIM = 11
 
 
 def _clip(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
+def _identity() -> list[list[float]]:
+    return [[1.0 if i == j else 0.0 for j in range(_DIM)] for i in range(_DIM)]
+
+
+def _dot(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _matvec(matrix: list[list[float]], vector: list[float]) -> list[float]:
+    return [_dot(row, vector) for row in matrix]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    denom = math.sqrt(_dot(a, a) * _dot(b, b))
+    if denom <= 1e-12:
+        return 0.0
+    return max(0.0, _dot(a, b) / denom)
+
+
+def _sigmoid(value: float) -> float:
+    value = max(-20.0, min(20.0, value))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
 @dataclass(slots=True)
 class PolicyProfile:
-    challenge_confidence: float = 0.76
-    stability_confidence: float = 0.80
-    min_pattern_posts: int = 3
-    min_stability_posts: int = 4
-    verdict_evidence_floor: int = 2
-    cost_weight: float = 0.18
-    caution_gain: float = 0.18
+    """Persistent self-evolving policy state.
+
+    Each investigation action owns a Bayesian linear value model represented by
+    a posterior mean vector and an inverse precision matrix. The initial state is
+    deliberately uninformative; domain behaviour is acquired from executed
+    trajectories and human review rather than hand-tuned action weights.
+    """
+
+    weights: dict[str, list[float]] = field(
+        default_factory=lambda: {action: [0.0] * _DIM for action in _ACTIONS}
+    )
+    covariance: dict[str, list[list[float]]] = field(
+        default_factory=lambda: {action: _identity() for action in _ACTIONS}
+    )
+    latency_ms: dict[str, float] = field(default_factory=dict)
+    latency_count: dict[str, int] = field(default_factory=dict)
+    experiences: list[dict[str, Any]] = field(default_factory=list)
+    steps: int = 0
+    reviews: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -25,17 +74,126 @@ class PolicyProfile:
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "PolicyProfile":
         base = cls()
-        if not raw:
+        if not raw or not isinstance(raw.get("weights"), dict):
             return base
+        weights: dict[str, list[float]] = {}
+        covariance: dict[str, list[list[float]]] = {}
+        incoming_cov = raw.get("covariance") if isinstance(raw.get("covariance"), dict) else {}
+        for action in _ACTIONS:
+            row = raw["weights"].get(action, [])
+            weights[action] = [float(v) for v in row[:_DIM]] if isinstance(row, list) else []
+            weights[action] += [0.0] * (_DIM - len(weights[action]))
+            matrix = incoming_cov.get(action)
+            if not isinstance(matrix, list) or len(matrix) != _DIM:
+                covariance[action] = _identity()
+            else:
+                parsed: list[list[float]] = []
+                valid = True
+                for values in matrix:
+                    if not isinstance(values, list) or len(values) != _DIM:
+                        valid = False
+                        break
+                    parsed.append([float(v) for v in values])
+                covariance[action] = parsed if valid else _identity()
+        experiences = [
+            item for item in (raw.get("experiences") or [])
+            if isinstance(item, dict) and item.get("action") in _ACTIONS
+        ]
         return cls(
-            challenge_confidence=float(raw.get("challenge_confidence", base.challenge_confidence)),
-            stability_confidence=float(raw.get("stability_confidence", base.stability_confidence)),
-            min_pattern_posts=int(raw.get("min_pattern_posts", base.min_pattern_posts)),
-            min_stability_posts=int(raw.get("min_stability_posts", base.min_stability_posts)),
-            verdict_evidence_floor=int(raw.get("verdict_evidence_floor", base.verdict_evidence_floor)),
-            cost_weight=_clip(float(raw.get("cost_weight", base.cost_weight)), 0.05, 0.45),
-            caution_gain=_clip(float(raw.get("caution_gain", base.caution_gain)), 0.05, 0.35),
+            weights=weights,
+            covariance=covariance,
+            latency_ms={k: float(v) for k, v in (raw.get("latency_ms") or {}).items() if k in _ACTIONS},
+            latency_count={k: int(v) for k, v in (raw.get("latency_count") or {}).items() if k in _ACTIONS},
+            experiences=experiences,
+            steps=max(0, int(raw.get("steps") or 0)),
+            reviews=max(0, int(raw.get("reviews") or 0)),
         )
+
+    def observe(self, trajectory: list[dict[str, Any]]) -> None:
+        for item in trajectory:
+            action = str(item.get("action") or "")
+            features = [float(v) for v in item.get("features") or []]
+            if action not in _ACTIONS or len(features) != _DIM:
+                continue
+            reward = max(-1.0, min(1.0, float(item.get("reward") or 0.0)))
+            self._recursive_update(action, features, reward)
+            alternative = str(item.get("alternative") or "")
+            alternative_features = [float(v) for v in item.get("alternative_features") or []]
+            if alternative in _ACTIONS and len(alternative_features) == _DIM and abs(reward) > 1e-9:
+                self._preference_update(
+                    action if reward >= 0 else alternative,
+                    features if reward >= 0 else alternative_features,
+                    alternative if reward >= 0 else action,
+                    alternative_features if reward >= 0 else features,
+                    abs(reward),
+                )
+            latency = max(0.0, float(item.get("duration_ms") or 0.0))
+            self._observe_latency(action, latency)
+            self._remember(action, features, reward)
+            self.steps += 1
+
+    def observe_review(self, trajectory: list[dict[str, Any]], correct: bool) -> None:
+        verdicts = [item for item in trajectory if item.get("action") == "verdict.compose"]
+        if verdicts:
+            item = verdicts[-1]
+            features = [float(v) for v in item.get("features") or []]
+            if len(features) == _DIM:
+                reward = 1.0 if correct else -1.0
+                self._recursive_update("verdict.compose", features, reward)
+                alternative = str(item.get("alternative") or "")
+                alternative_features = [float(v) for v in item.get("alternative_features") or []]
+                if alternative in _ACTIONS and len(alternative_features) == _DIM:
+                    self._preference_update(
+                        "verdict.compose" if correct else alternative,
+                        features if correct else alternative_features,
+                        alternative if correct else "verdict.compose",
+                        alternative_features if correct else features,
+                        1.0,
+                    )
+        self.reviews += 1
+
+    def _recursive_update(self, action: str, x: list[float], reward: float) -> None:
+        covariance = self.covariance[action]
+        px = _matvec(covariance, x)
+        denominator = 1.0 + _dot(x, px)
+        prediction = _dot(self.weights[action], x)
+        residual = reward - prediction
+        self.weights[action] = [w + (gain / denominator) * residual for w, gain in zip(self.weights[action], px)]
+        self.covariance[action] = [
+            [covariance[i][j] - px[i] * px[j] / denominator for j in range(_DIM)]
+            for i in range(_DIM)
+        ]
+
+    def _preference_update(
+        self,
+        preferred: str,
+        preferred_x: list[float],
+        rejected: str,
+        rejected_x: list[float],
+        strength: float,
+    ) -> None:
+        preferred_score = _dot(self.weights[preferred], preferred_x)
+        rejected_score = _dot(self.weights[rejected], rejected_x)
+        gradient = (1.0 - _sigmoid(preferred_score - rejected_score)) * strength / math.sqrt(self.steps + 1.0)
+        self.weights[preferred] = [w + gradient * x for w, x in zip(self.weights[preferred], preferred_x)]
+        self.weights[rejected] = [w - gradient * x for w, x in zip(self.weights[rejected], rejected_x)]
+
+    def _observe_latency(self, action: str, latency: float) -> None:
+        if latency <= 0.0:
+            return
+        count = self.latency_count.get(action, 0) + 1
+        mean = self.latency_ms.get(action, latency)
+        self.latency_ms[action] = mean + (latency - mean) / count
+        self.latency_count[action] = count
+
+    def _remember(self, action: str, features: list[float], reward: float) -> None:
+        digest = hashlib.sha256(
+            (action + "|" + "|".join(f"{value:.6f}" for value in features) + f"|{reward:.6f}").encode()
+        ).hexdigest()
+        self.experiences.append({"action": action, "features": features, "reward": reward, "key": digest})
+        capacity = max(64, int(os.getenv("GUANCHAO_POLICY_MEMORY", "512")))
+        if len(self.experiences) > capacity:
+            self.experiences = sorted(self.experiences, key=lambda item: str(item.get("key") or ""))[:capacity]
 
 
 @dataclass(slots=True)
@@ -43,26 +201,13 @@ class Decision:
     tool: str
     reason: str
     utility: float
+    features: list[float] = field(default_factory=list)
+    alternative: str = ""
+    alternative_features: list[float] = field(default_factory=list)
 
 
 class OwnedPolicy:
-    """Information-gain controller with explicit observation cost.
-
-    The old controller compared large hand-picked utility constants. This policy
-    instead computes normalized expected information gain in [0, 1], subtracts
-    an interpretable observation cost, and applies hard blockers only where a
-    trustworthy verdict requires them.
-    """
-
-    _COST = {
-        "profile.read": 0.14,
-        "media.inspect": 0.34,
-        "pattern.compare": 0.24,
-        "peer.compare": 0.32,
-        "stability.probe": 0.42,
-        "evidence.challenge": 0.38,
-        "verdict.compose": 0.08,
-    }
+    """Self-evolving contextual policy with experience replay."""
 
     def __init__(self, profile: PolicyProfile | None = None):
         self.profile = profile or PolicyProfile()
@@ -75,91 +220,129 @@ class OwnedPolicy:
             return Decision("workspace.inspect", "先确认资料、素材和缺口", 1.0)
         if "content.scan" not in completed:
             return Decision("content.scan", "先建立近期内容的基础判断", 1.0)
+        candidates = self._available(state, completed)
+        if not candidates:
+            return None
+        scored: list[tuple[float, str, list[float]]] = []
+        for action in candidates:
+            features = self.features(goal, state, action)
+            scored.append((self._score(action, features), action, features))
+        scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        utility, action, features = scored[0]
+        alternative = scored[1][1] if len(scored) > 1 else ""
+        alternative_features = scored[1][2] if len(scored) > 1 else []
+        return Decision(action, self._reason(action), utility, features, alternative, alternative_features)
 
+    def features(self, goal: str, state: dict[str, Any], action: str) -> list[float]:
         targets = state.get("targets") or []
-        sample_size = int(state.get("sample_size") or 0)
         assets = state.get("assets") or []
-        ready_assets = sum(1 for a in assets if a.get("status") == "ready")
+        primary = state.get("primary_result") or {}
+        confidence = _clip(float(primary.get("confidence") or 0.0))
+        marketing = _clip(float(primary.get("marketing_likelihood") or 0.5))
+        stability = _clip(float(primary.get("stability") or 0.0))
+        sample_size = max(0, int(state.get("sample_size") or 0))
+        evidence_count = len({(e.get("key"), e.get("direction")) for e in state.get("evidence") or []})
+        ready_assets = sum(1 for item in assets if item.get("status") == "ready")
+        uncertainty = 1.0 - confidence
+        boundary = 1.0 - min(1.0, abs(marketing - 0.5) * 2.0)
+        instability = 1.0 - stability
+        sample_support = sample_size / (sample_size + 1.0)
+        evidence_support = evidence_count / (evidence_count + 1.0)
+        asset_support = ready_assets / len(assets) if assets else 0.0
+        has_bio = 1.0 if targets and targets[0].get("bio") else 0.0
+        peer_support = (len(targets) - 1) / len(targets) if targets else 0.0
+        cautious = 1.0 if any(word in goal for word in ("误判", "反向", "谨慎", "仔细", "认真", "证据", "核实", "复核")) else 0.0
+        need = self._action_need(action, uncertainty, boundary, instability, sample_support, evidence_support, asset_support, has_bio, peer_support, cautious)
+        return [1.0, uncertainty, boundary, instability, sample_support, evidence_support, asset_support, has_bio, peer_support, cautious, need]
+
+    def reward(self, before: dict[str, float], after: dict[str, float], action: str, duration_ms: float) -> float:
+        gains = [before["uncertainty"] - after["uncertainty"], before["instability"] - after["instability"], after["evidence_support"] - before["evidence_support"]]
+        if action == "verdict.compose":
+            gains.append(after["verdict_readiness"] - before["verdict_readiness"])
+        raw = sum(gains) / len(gains)
+        latencies = [value for value in self.profile.latency_ms.values() if value > 0]
+        if duration_ms > 0 and latencies:
+            reference = sorted(latencies)[len(latencies) // 2]
+            raw /= 1.0 + duration_ms / max(reference, 1e-6)
+        return max(-1.0, min(1.0, raw))
+
+    def signal(self, state: dict[str, Any]) -> dict[str, float]:
         primary = state.get("primary_result") or {}
         confidence = _clip(float(primary.get("confidence") or 0.0))
         marketing = _clip(float(primary.get("marketing_likelihood") or 0.5))
         stability = _clip(float(primary.get("stability") or 0.0))
         evidence_count = len({(e.get("key"), e.get("direction")) for e in state.get("evidence") or []})
-        cautious = any(word in goal for word in ("误判", "反向", "谨慎", "仔细", "认真", "证据", "核实", "复核"))
-
-        uncertainty = 1.0 - confidence
+        evidence_support = evidence_count / (evidence_count + 1.0)
         boundary = 1.0 - min(1.0, abs(marketing - 0.5) * 2.0)
-        sample_support = 1.0 - math.exp(-sample_size / 5.0)
-        evidence_support = min(1.0, evidence_count / max(1, self.profile.verdict_evidence_floor + 1))
-        caution = self.profile.caution_gain if cautious else 0.0
+        return {"uncertainty": 1.0 - confidence, "instability": 1.0 - stability, "evidence_support": evidence_support, "verdict_readiness": confidence * stability * evidence_support * (1.0 - boundary)}
 
-        candidates: list[Decision] = []
+    def _score(self, action: str, features: list[float]) -> float:
+        mean = _dot(self.profile.weights[action], features)
+        covariance = self.profile.covariance[action]
+        variance = max(1e-12, _dot(features, _matvec(covariance, features)))
+        replay_rows: list[tuple[float, float]] = []
+        for item in self.profile.experiences:
+            if item.get("action") != action:
+                continue
+            other = item.get("features") or []
+            if not isinstance(other, list) or len(other) != _DIM:
+                continue
+            similarity = _cosine(features, [float(v) for v in other])
+            if similarity > 0:
+                replay_rows.append((similarity, float(item.get("reward") or 0.0)))
+        if replay_rows:
+            replay_rows.sort(reverse=True)
+            replay_rows = replay_rows[: max(1, math.ceil(math.sqrt(len(replay_rows))))]
+            replay_precision = sum(similarity for similarity, _ in replay_rows)
+            model_precision = 1.0 / variance
+            replay_value = sum(similarity * reward for similarity, reward in replay_rows) / replay_precision
+            mean = (model_precision * mean + replay_precision * replay_value) / (model_precision + replay_precision)
+        exploration = math.sqrt(variance * math.log(self.profile.steps + 2.0))
+        return mean + exploration
 
-        def add(tool: str, gain: float, reason: str) -> None:
-            if tool in completed:
-                return
-            cost = self._COST.get(tool, 0.2)
-            utility = _clip(gain) - self.profile.cost_weight * cost
-            candidates.append(Decision(tool, reason, utility))
-
-        has_bio = bool(targets and targets[0].get("bio"))
-        if has_bio:
-            gain = 0.30 + 0.35 * uncertainty + 0.35 * boundary
-            add("profile.read", gain, "主页信息能补充长期身份与经营背景")
-
-        if assets:
-            readiness = ready_assets / len(assets)
-            gain = 0.34 + 0.36 * readiness + 0.30 * max(uncertainty, boundary)
-            add("media.inspect", gain, "多模态素材能提供独立于文本的交叉证据")
-
-        if sample_size >= self.profile.min_pattern_posts:
-            gain = sample_support * (0.32 + 0.40 * boundary + 0.28 * uncertainty)
-            add("pattern.compare", gain, "跨内容模式可以检验是否存在长期批量化行为")
-
-        if len(targets) > 1:
-            peer_support = 1.0 - math.exp(-(len(targets) - 1) / 4.0)
-            gain = peer_support * (0.38 + 0.34 * boundary + 0.28 * uncertainty)
-            add("peer.compare", gain, "同批账号提供相对背景，能减少孤立判断")
-
-        stability_needed = (
-            sample_size >= self.profile.min_stability_posts
-            and (
-                confidence < self.profile.stability_confidence
-                or stability < 0.72
-                or boundary > 0.42
-                or cautious
-            )
-        )
-        if stability_needed:
-            gain = max(uncertainty, 1.0 - stability, 0.75 * boundary) + caution
-            add("stability.probe", gain, "需要确认结论是否被少数内容主导")
-
-        challenge_needed = (
-            confidence < self.profile.challenge_confidence
-            or boundary > 0.46
-            or cautious
-        )
-        if challenge_needed:
-            gain = max(uncertainty, boundary) + caution
-            add("evidence.challenge", gain, "主动寻找能推翻当前倾向的证据")
-
-        blockers: list[str] = []
+    @staticmethod
+    def _available(state: dict[str, Any], completed: set[str]) -> list[str]:
+        targets = state.get("targets") or []
+        assets = state.get("assets") or []
+        sample_size = max(0, int(state.get("sample_size") or 0))
+        primary = state.get("primary_result") or {}
+        evidence = state.get("evidence") or []
+        candidates: list[str] = []
+        if targets and targets[0].get("bio") and "profile.read" not in completed:
+            candidates.append("profile.read")
         if assets and "media.inspect" not in completed:
-            blockers.append("media.inspect")
-        if has_bio and "profile.read" not in completed:
-            blockers.append("profile.read")
-        if cautious and sample_size >= self.profile.min_stability_posts and "stability.probe" not in completed:
-            blockers.append("stability.probe")
-        if cautious and "evidence.challenge" not in completed:
-            blockers.append("evidence.challenge")
+            candidates.append("media.inspect")
+        if sample_size > 1 and "pattern.compare" not in completed:
+            candidates.append("pattern.compare")
+        if len(targets) > 1 and "peer.compare" not in completed:
+            candidates.append("peer.compare")
+        if sample_size > 1 and "stability.probe" not in completed:
+            candidates.append("stability.probe")
+        if "evidence.challenge" not in completed:
+            candidates.append("evidence.challenge")
+        if primary and evidence and "verdict.compose" not in completed:
+            candidates.append("verdict.compose")
+        return candidates
 
-        if evidence_count >= self.profile.verdict_evidence_floor and not blockers:
-            verdict_gain = confidence * (0.55 + 0.45 * stability) * (1.0 - 0.58 * boundary)
-            verdict_gain *= 0.72 + 0.28 * evidence_support
-            add("verdict.compose", verdict_gain, "当前证据覆盖与稳定性已达到成案条件")
-        elif sample_size < 3 and "profile.read" in completed and not blockers:
-            add("verdict.compose", 0.28, "资料有限，只形成带明确缺口的谨慎判断")
+    @staticmethod
+    def _action_need(action: str, uncertainty: float, boundary: float, instability: float, sample_support: float, evidence_support: float, asset_support: float, has_bio: float, peer_support: float, cautious: float) -> float:
+        if action == "profile.read": return has_bio * max(uncertainty, boundary)
+        if action == "media.inspect": return asset_support * max(uncertainty, boundary)
+        if action == "pattern.compare": return sample_support * boundary
+        if action == "peer.compare": return peer_support * max(uncertainty, boundary)
+        if action == "stability.probe": return sample_support * max(instability, boundary, cautious)
+        if action == "evidence.challenge": return max(uncertainty, boundary, cautious)
+        if action == "verdict.compose": return (1.0 - uncertainty) * (1.0 - instability) * evidence_support * (1.0 - boundary)
+        return 0.0
 
-        if not candidates:
-            return None
-        return max(candidates, key=lambda item: item.utility)
+    @staticmethod
+    def _reason(action: str) -> str:
+        return {
+            "profile.read": "历史经验判断主页信息在当前上下文仍有较高信息价值",
+            "media.inspect": "历史经验判断多模态素材在当前上下文仍有较高信息价值",
+            "pattern.compare": "历史经验判断跨内容模式对当前不确定性最有帮助",
+            "peer.compare": "历史经验判断同批账号对当前判断具有较高比较价值",
+            "stability.probe": "历史经验判断当前结论需要进一步做反事实稳定性检查",
+            "evidence.challenge": "历史经验判断主动寻找反向证据更可能降低当前风险",
+            "verdict.compose": "历史经验判断继续观察的边际收益已低于形成可复核判断",
+        }.get(action, "根据历史调查经验选择下一项核查")
