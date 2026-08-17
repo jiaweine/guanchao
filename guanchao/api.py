@@ -37,11 +37,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         case_id = _case_id_from_path(path)
         is_target_refresh = bool(case_id and method == 'PATCH' and path.endswith('/target'))
         is_asset_upload = bool(case_id and method == 'POST' and path.endswith('/assets'))
+        needs_guard = is_target_refresh or is_asset_upload
 
-        member = _request_member(app, request)
+        member = _request_member(app, request) if needs_guard else None
         can_manage = bool(member and member.get('role') in {'admin', 'analyst'})
 
-        if can_manage and case_id and (is_target_refresh or is_asset_upload):
+        if can_manage and case_id:
             try:
                 case = app.state.store.get_case(case_id)
             except KeyError:

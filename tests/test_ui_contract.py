@@ -89,5 +89,7 @@ def test_customer_workspace_has_collaborative_notes_separate_from_agent_chat():
 
 def test_runtime_protects_drafts_stale_writes_and_modal_keyboard_access():
     runtime = Path('frontend/runtime.mjs').read_text(encoding='utf-8')
-    for token in ['restoreDraft', 'staleWriteResponse', 'isSensitiveCaseWrite', "event.key !== 'Escape'", '证据快照']:
+    for token in ['restoreDraft', 'staleWriteResponse', 'isSensitiveCaseWrite', "event.key !== 'Escape'", '避免素材漏出本轮证据']:
         assert token in runtime
+    backend = Path('guanchao/api.py').read_text(encoding='utf-8')
+    assert '证据快照' in backend
