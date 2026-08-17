@@ -127,6 +127,10 @@ function setReviewControls(item, latest) {
 }
 
 async function openCase(id) {
+  if (state.caseId && state.caseId !== id && state.polling) {
+    clearInterval(state.polling);
+    state.polling = null;
+  }
   try {
     const item = await api(`/api/cases/${id}`);
     state.caseId = id;
@@ -274,8 +278,10 @@ async function sendMessage() {
 function beginPolling(runId) {
   clearInterval(state.polling);
   const tick = async () => {
+    if (runId !== state.runId) return;
     try {
       const run = await api(`/api/runs/${runId}`);
+      if (runId !== state.runId) return;
       renderRun(run);
       if (run.status !== 'running') {
         clearInterval(state.polling);

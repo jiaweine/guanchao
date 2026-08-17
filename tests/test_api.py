@@ -215,3 +215,17 @@ def test_delete_case_removes_persisted_assets(tmp_path, monkeypatch):
     assert deleted.status_code == 200
     assert client.get(f"/api/cases/{case['id']}").status_code == 404
     assert list(Path(asset_dir).iterdir()) == []
+
+
+def test_review_queue_never_surfaces_an_older_result_after_newer_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("GUANCHAO_ASSET_DIR", str(tmp_path / "assets"))
+    app = create_app(str(tmp_path / "db.sqlite"))
+    client = TestClient(app)
+    case = make_case(client)
+    first = client.post(f"/api/cases/{case['id']}/messages", json={"content": "先核查一次"})
+    completed = wait_for_run(client, first.json()["run_id"])
+    assert completed["state"].get("primary_result")
+    newer = app.state.store.create_run(case["id"], {"goal": "新的核查", "primary_result": {}})
+    app.state.store.update_run(newer["id"], {"goal": "新的核查", "primary_result": {}}, "failed")
+    queue = client.get("/api/review-queue?reviewed=false").json()
+    assert all(item["case_id"] != case["id"] for item in queue)

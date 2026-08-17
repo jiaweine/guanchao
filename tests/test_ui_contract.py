@@ -29,3 +29,9 @@ def test_first_release_has_no_product_version_aliases():
     pattern = re.compile(r"(?i)(^|[^a-z0-9])v[12]([^a-z0-9]|$)")
     for path in paths:
         assert not pattern.search(path.read_text(encoding="utf-8")), path
+
+
+def test_switching_cases_discards_stale_polling_results():
+    text = Path("frontend/app.js").read_text(encoding="utf-8")
+    assert "state.caseId && state.caseId !== id && state.polling" in text
+    assert text.count("if (runId !== state.runId) return;") >= 2

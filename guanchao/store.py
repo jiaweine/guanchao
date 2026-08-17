@@ -174,9 +174,12 @@ class Store:
             if not row:
                 self._close(conn)
                 raise KeyError(case_id)
-            paths = [item["storage_path"] for item in conn.execute(
-                "SELECT storage_path FROM assets WHERE case_id = ?", (case_id,)
-            ).fetchall()]
+            paths = [
+                item["storage_path"]
+                for item in conn.execute(
+                    "SELECT storage_path FROM assets WHERE case_id = ?", (case_id,)
+                ).fetchall()
+            ]
             conn.execute("DELETE FROM cases WHERE id = ?", (case_id,))
             conn.commit()
             self._close(conn)
@@ -352,7 +355,7 @@ class Store:
         review_id = uuid.uuid4().hex[:12]
         with self._lock:
             conn = self._connect()
-            existing = conn.execute("SELECT id, created_at FROM reviews WHERE run_id = ?", (run_id,)).fetchone()
+            existing = conn.execute("SELECT id FROM reviews WHERE run_id = ?", (run_id,)).fetchone()
             if existing:
                 review_id = existing["id"]
                 conn.execute(
@@ -413,11 +416,12 @@ class Store:
                 FROM cases c
                 JOIN runs r ON r.id = (
                     SELECT r2.id FROM runs r2
-                    WHERE r2.case_id = c.id AND r2.status = 'completed'
+                    WHERE r2.case_id = c.id
                     ORDER BY r2.created_at DESC LIMIT 1
                 )
                 LEFT JOIN reviews rv ON rv.run_id = r.id
-                WHERE NOT EXISTS (
+                WHERE r.status = 'completed'
+                  AND NOT EXISTS (
                     SELECT 1 FROM runs active
                     WHERE active.case_id = c.id AND active.status = 'running'
                 )
@@ -475,7 +479,12 @@ class Store:
                 run = self.get_run(row["run_id"])
             except KeyError:
                 continue
-            score = float((run.get("state") or {}).get("primary_result", {}).get("marketing_likelihood") or 0.0)
+            score = float(
+                (run.get("state") or {})
+                .get("primary_result", {})
+                .get("marketing_likelihood")
+                or 0.0
+            )
             predicted_marketing = score >= 0.5
             human_marketing = row["decision"] == "confirm_marketing"
             accepted += int(predicted_marketing == human_marketing)
@@ -486,7 +495,9 @@ class Store:
             "acceptance_rate": round(accepted / len(decisive), 4) if decisive else None,
             "uncertain_rate": round(
                 sum(1 for row in reviews if row["decision"] == "uncertain") / len(reviews), 4
-            ) if reviews else None,
+            )
+            if reviews
+            else None,
         }
 
     def labeled_examples(self) -> list[LabeledExample]:
