@@ -1,4 +1,4 @@
-import { isCaseDetailRequest, requestMeta } from './runtime.mjs';
+import { caseIdFromRequest, isCaseDetailRequest, requestMeta } from './runtime.mjs';
 
 const KIND_NAMES = { image: '图片', video: '视频', audio: '音频', document: '文档', other: '素材' };
 
@@ -19,6 +19,22 @@ export function canOfferAssetDelete(caseSnapshot, controlsWritable) {
 export function removeAssetFromSnapshot(snapshot, assetId) {
   snapshot.assets = (snapshot.assets || []).filter((item) => item.id !== assetId);
   return snapshot.assets;
+}
+
+export function isCaseReportRequest(meta) {
+  return meta.method === 'GET' && /^\/api\/cases\/[^/]+\/report$/.test(meta.url.pathname);
+}
+
+export function shouldDiscardCaseBoundResult(meta, selectedCaseId) {
+  const requestCaseId = caseIdFromRequest(meta);
+  return Boolean(isCaseReportRequest(meta) && requestCaseId && selectedCaseId && requestCaseId !== selectedCaseId);
+}
+
+function staleResultResponse(caseId) {
+  return new Response(
+    JSON.stringify({ detail: `已切换到另一调查，已取消原调查 ${caseId} 的结果交付。` }),
+    { status: 409, headers: { 'content-type': 'application/json; charset=utf-8' } },
+  );
 }
 
 function notify(documentRef, message) {
@@ -184,6 +200,15 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
   installModalKeyboard(documentRef);
   installModalInertState(windowRef, documentRef);
 
+  let selectedSnapshot = null;
+  const assetList = documentRef.querySelector?.('#assetList');
+  if (assetList && typeof windowRef.MutationObserver === 'function') {
+    const observer = new windowRef.MutationObserver(() => {
+      if (selectedSnapshot) decorateAssetDeleteActions(windowRef, documentRef, selectedSnapshot);
+    });
+    observer.observe(assetList, { childList: true, subtree: true });
+  }
+
   documentRef.addEventListener('click', (event) => {
     if (event.target.closest?.('.insight-tabs button')) queueMicrotask(() => syncTabSelection(documentRef));
   });
@@ -192,11 +217,16 @@ export function installInteractionEnhancements({ windowRef = window, documentRef
   windowRef.fetch = async (input, init = {}) => {
     const meta = requestMeta(input, init, windowRef.location.href);
     const response = await guardedFetch(input, init);
+
+    if (shouldDiscardCaseBoundResult(meta, selectedSnapshot?.id) && response.ok) {
+      return staleResultResponse(caseIdFromRequest(meta));
+    }
+
     if (isCaseDetailRequest(meta) && response.ok) {
       response.clone().json().then((snapshot) => {
         if (!snapshot?.id || snapshot.id === '__stale_case_request__') return;
+        selectedSnapshot = snapshot;
         queueMicrotask(() => decorateAssetDeleteActions(windowRef, documentRef, snapshot));
-        setTimeout(() => decorateAssetDeleteActions(windowRef, documentRef, snapshot), 20);
       }).catch(() => {});
     }
     return response;

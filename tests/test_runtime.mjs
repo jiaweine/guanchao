@@ -8,7 +8,13 @@ import {
   isSensitiveCaseWrite,
   requestMeta,
 } from '../frontend/runtime.mjs';
-import { assetDeletePath, canOfferAssetDelete, removeAssetFromSnapshot } from '../frontend/interaction.mjs';
+import {
+  assetDeletePath,
+  canOfferAssetDelete,
+  isCaseReportRequest,
+  removeAssetFromSnapshot,
+  shouldDiscardCaseBoundResult,
+} from '../frontend/interaction.mjs';
 
 const response = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 
@@ -101,4 +107,13 @@ test('asset management only offers deletion for writable idle cases and survives
   const snapshot = { assets: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] };
   assert.deepEqual(removeAssetFromSnapshot(snapshot, 'a').map((item) => item.id), ['b', 'c']);
   assert.deepEqual(removeAssetFromSnapshot(snapshot, 'b').map((item) => item.id), ['c']);
+});
+
+test('case-bound report result is discarded after switching to another investigation', () => {
+  const report = requestMeta('/api/cases/a/report?output=markdown', {}, 'http://local/?case=a');
+  assert.equal(isCaseReportRequest(report), true);
+  assert.equal(shouldDiscardCaseBoundResult(report, 'a'), false);
+  assert.equal(shouldDiscardCaseBoundResult(report, 'b'), true);
+  const ordinaryRead = requestMeta('/api/cases/a', {}, 'http://local/?case=b');
+  assert.equal(shouldDiscardCaseBoundResult(ordinaryRead, 'b'), false);
 });
