@@ -2,6 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import guanchao.api as api_module
 from guanchao.api import create_app
 from guanchao.harness import RunCapacityError
 
@@ -124,9 +125,9 @@ def test_read_hot_path_does_not_invoke_extra_wrapper_member_lookup(tmp_path, mon
     app = create_app(str(tmp_path / 'db.sqlite'))
     client = TestClient(app)
 
-    def forbidden_lookup(self, member_id):
+    def forbidden_lookup(app, request):
         raise AssertionError('wrapper member lookup leaked into read hot path')
 
-    monkeypatch.setattr(type(app.state.store), 'get_member', forbidden_lookup)
+    monkeypatch.setattr(api_module, '_request_member', forbidden_lookup)
     response = client.get('/api/status')
     assert response.status_code == 200
