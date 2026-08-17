@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -98,6 +100,70 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app.state.harness = harness
     app.state.perception = perception
     trust_actor_header = os.getenv("GUANCHAO_TRUST_ACTOR_HEADER", "0").strip().lower() in {"1", "true", "yes"}
+    view_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
+    view_cache_lock = threading.RLock()
+
+    def invalidate_view_cache() -> None:
+        with view_cache_lock:
+            view_cache.clear()
+
+    def cached_view(
+        key: tuple[Any, ...],
+        builder: Any,
+        *,
+        ttl: float = 0.75,
+    ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        with view_cache_lock:
+            cached = view_cache.get(key)
+            if cached and now - cached[0] < ttl:
+                return cached[1]
+        value = builder()
+        with view_cache_lock:
+            view_cache[key] = (time.monotonic(), value)
+        return value
+
+    def compact_target(target: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: target.get(key)
+            for key in ("platform", "handle", "display_name", "profile_url")
+            if target.get(key) not in (None, "")
+        }
+
+    def compact_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not result:
+            return None
+        return {
+            key: result.get(key)
+            for key in (
+                "label",
+                "summary",
+                "confidence",
+                "stability",
+                "marketing_likelihood",
+                "covert_promotion_risk",
+                "missing",
+            )
+            if key in result
+        }
+
+    def compact_case_summary(item: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(item)
+        payload["targets"] = [compact_target(target) for target in item.get("targets") or []]
+        payload["latest_result"] = compact_result(item.get("latest_result"))
+        return payload
+
+    def compact_review_summary(item: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(item)
+        payload["targets"] = [compact_target(target) for target in item.get("targets") or []]
+        payload["result"] = compact_result(item.get("result")) or {}
+        return payload
+
+    @app.middleware("http")
+    async def clear_cached_views_on_write(request: Request, call_next: Any) -> Response:
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            invalidate_view_cache()
+        return await call_next(request)
 
     def actor(request: Request) -> dict[str, Any]:
         member_id = "local"
@@ -212,9 +278,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         priority: Literal["", "low", "normal", "high"] = "",
         sort: Literal["updated_desc", "updated_asc", "created_desc", "risk_desc"] = "updated_desc",
         batch_id: str = "",
+        limit: int = Query(default=200, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         actor(request)
-        return store.list_cases(query, platform, status, owner, priority, sort, batch_id)
+        key = ("cases", query, platform, status, owner, priority, sort, batch_id)
+        items = cached_view(
+            key,
+            lambda: [
+                compact_case_summary(item)
+                for item in store.list_cases(query, platform, status, owner, priority, sort, batch_id)
+            ],
+        )
+        return items[:limit]
 
     @app.post("/api/cases")
     def create_case(payload: CaseCreate, request: Request) -> dict[str, Any]:
@@ -436,9 +511,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         owner: str = "",
         priority: Literal["", "low", "normal", "high"] = "",
         sort: Literal["priority_desc", "risk_desc", "newest"] = "priority_desc",
+        limit: int = Query(default=200, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         actor(request)
-        return store.review_queue(reviewed, query, platform, owner, priority, sort)
+        key = ("review-queue", reviewed, query, platform, owner, priority, sort)
+        items = cached_view(
+            key,
+            lambda: [
+                compact_review_summary(item)
+                for item in store.review_queue(reviewed, query, platform, owner, priority, sort)
+            ],
+        )
+        return items[:limit]
 
     @app.get("/api/monitoring")
     def monitoring_queue(request: Request, due_only: bool = True) -> list[dict[str, Any]]:

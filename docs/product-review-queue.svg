@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <rect width="1200" height="720" rx="24" fill="#f2f0ea"/>
+  <rect x="26" y="26" width="1148" height="668" rx="18" fill="#faf9f5" stroke="#d8d6cf"/>
+  <rect x="26" y="26" width="292" height="668" rx="18" fill="#eceae4"/>
+  <path d="M318 26V694M26 88H1174" stroke="#d8d6cf"/>
+  <g font-family="system-ui,-apple-system,'PingFang SC',sans-serif" fill="#191d1c">
+    <text x="48" y="63" font-size="21" font-weight="700">观潮</text>
+    <text x="350" y="61" font-size="12" fill="#707772">待复核 18 · 待更新 4 · 本周已确认 63</text>
+    <rect x="1008" y="42" width="132" height="32" rx="16" fill="#191d1c"/><text x="1041" y="63" font-size="11" fill="#fff">批量导入</text>
+
+    <text x="48" y="124" font-size="13" font-weight="700">待复核</text><text x="122" y="124" font-size="12" fill="#707772">全部调查</text><text x="210" y="124" font-size="12" fill="#707772">待更新</text>
+    <path d="M48 138H92" stroke="#2e6760" stroke-width="2.5"/>
+    <rect x="44" y="158" width="250" height="36" rx="8" fill="#faf9f5" stroke="#d8d6cf"/><text x="60" y="181" font-size="10" fill="#707772">搜索账号、平台或调查目标</text>
+    <rect x="44" y="207" width="118" height="32" rx="8" fill="#faf9f5" stroke="#d8d6cf"/><text x="58" y="228" font-size="10" fill="#707772">微博</text>
+    <rect x="176" y="207" width="118" height="32" rx="8" fill="#faf9f5" stroke="#d8d6cf"/><text x="190" y="228" font-size="10" fill="#707772">复核优先</text>
+
+    <rect x="38" y="258" width="268" height="70" rx="10" fill="#fffdf9" stroke="#b9cbc6"/>
+    <circle cx="57" cy="280" r="4" fill="#2e6760"/><text x="70" y="284" font-size="12" font-weight="650">数码夜航</text><rect x="247" y="269" width="42" height="18" rx="9" fill="#e6efec"/><text x="256" y="282" font-size="8" fill="#2e6760">复核 91</text>
+    <text x="70" y="307" font-size="9" fill="#707772">微博 · 高度营销化 · 把握度 86%</text>
+    <rect x="38" y="338" width="268" height="62" rx="10" fill="#f6f4ef"/><text x="58" y="361" font-size="12" font-weight="650">护肤观察局</text><text x="58" y="384" font-size="9" fill="#707772">微博 · 明显营销倾向 · 79%</text>
+    <rect x="38" y="410" width="268" height="62" rx="10" fill="#f6f4ef"/><text x="58" y="433" font-size="12" font-weight="650">好物研究所</text><text x="58" y="456" font-size="9" fill="#707772">微博 · 存在营销信号 · 71%</text>
+    <rect x="38" y="482" width="268" height="62" rx="10" fill="#f6f4ef"/><text x="58" y="505" font-size="12" font-weight="650">城市漫游志</text><text x="58" y="528" font-size="9" fill="#707772">微博 · 更像普通创作者 · 74%</text>
+
+    <text x="350" y="128" font-size="11" fill="#707772">微博 · 数码夜航</text>
+    <text x="350" y="165" font-size="28" font-weight="720">数码夜航 · 账号调查</text>
+    <text x="350" y="192" font-size="12" fill="#707772">优先寻找能够推翻营销判断的线索，避免单条内容支配结论。</text>
+
+    <rect x="350" y="230" width="792" height="118" rx="14" fill="#f2f0ea"/>
+    <text x="374" y="260" font-size="10" fill="#707772">复核优先级</text><text x="374" y="302" font-size="34" font-weight="760">91</text>
+    <text x="514" y="260" font-size="10" fill="#707772">营销倾向</text><text x="514" y="302" font-size="26" font-weight="700">84%</text>
+    <text x="654" y="260" font-size="10" fill="#707772">把握度</text><text x="654" y="302" font-size="26" font-weight="700">86%</text>
+    <text x="794" y="260" font-size="10" fill="#707772">稳定性</text><text x="794" y="302" font-size="26" font-weight="700">76%</text>
+    <text x="934" y="260" font-size="10" fill="#707772">资料状态</text><text x="934" y="302" font-size="16" font-weight="650">可复核</text>
+
+    <text x="350" y="392" font-size="11" font-weight="700">人工复核</text>
+    <text x="350" y="421" font-size="12" fill="#707772">结论与证据已经绑定到当前执行记录。灰区可以直接标记“无法判断”，不会污染训练样本。</text>
+    <rect x="350" y="462" width="228" height="78" rx="12" fill="#faf9f5" stroke="#d8d6cf"/><text x="373" y="493" font-size="11" fill="#707772">1</text><text x="407" y="493" font-size="14" font-weight="680">普通创作者</text><text x="407" y="518" font-size="9" fill="#707772">确认当前证据不足以支持营销运营</text>
+    <rect x="590" y="462" width="228" height="78" rx="12" fill="#faf9f5" stroke="#d8d6cf"/><text x="613" y="493" font-size="11" fill="#707772">2</text><text x="647" y="493" font-size="14" font-weight="680">无法判断</text><text x="647" y="518" font-size="9" fill="#707772">保留争议，不进入二元训练标签</text>
+    <rect x="830" y="462" width="228" height="78" rx="12" fill="#191d1c"/><text x="853" y="493" font-size="11" fill="#c9d8d4">3</text><text x="887" y="493" font-size="14" font-weight="680" fill="#fff">营销运营</text><text x="887" y="518" font-size="9" fill="#d9dedc">提交后自动进入下一条待复核任务</text>
+
+    <text x="350" y="600" font-size="10" fill="#707772">队列排序同时考虑业务优先级、营销倾向、隐性推广风险、把握度、稳定性与资料缺口。</text>
+  </g>
+</svg>

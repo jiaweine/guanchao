@@ -161,7 +161,6 @@ class AgentHarness:
                         "decision", "继续核查", decision.reason, decision.tool, "working"
                     ).asdict()
                 )
-                self.store.update_run(run_id, state, "running")
                 result = registry.get(decision.tool).handler(state)
                 ok, reason = self.verifier.verify(result)
                 if not ok:

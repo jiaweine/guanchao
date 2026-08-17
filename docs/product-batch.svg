@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <rect width="1200" height="720" rx="24" fill="#f2f0ea"/>
+  <rect x="26" y="26" width="1148" height="668" rx="18" fill="#faf9f5" stroke="#d8d6cf"/>
+  <g font-family="system-ui,-apple-system,'PingFang SC',sans-serif" fill="#191d1c">
+    <text x="48" y="63" font-size="21" font-weight="700">观潮</text><text x="350" y="61" font-size="12" fill="#707772">批量账号调查</text>
+    <text x="70" y="126" font-size="10" fill="#707772">批量导入</text><text x="70" y="168" font-size="31" font-weight="740">把一批账号变成独立、可复核的调查任务</text>
+    <text x="70" y="199" font-size="12" fill="#707772">支持 JSON、CSV 和直接粘贴。每个账号拥有独立证据、执行记录与人工复核。</text>
+
+    <rect x="70" y="244" width="632" height="344" rx="16" fill="#f2f0ea"/>
+    <text x="94" y="278" font-size="11" font-weight="680">账号列表</text><text x="626" y="278" font-size="9" fill="#707772">已识别 12 个</text>
+    <rect x="94" y="300" width="584" height="54" rx="10" fill="#faf9f5"/><text x="112" y="323" font-size="11" font-weight="650">数码夜航</text><text x="112" y="342" font-size="8" fill="#707772">微博 · 6 条近期内容 · 商务合作简介</text><text x="615" y="332" font-size="9" fill="#2e6760">可导入</text>
+    <rect x="94" y="364" width="584" height="54" rx="10" fill="#faf9f5"/><text x="112" y="387" font-size="11" font-weight="650">城市漫游志</text><text x="112" y="406" font-size="8" fill="#707772">微博 · 8 条近期内容 · 城市摄影</text><text x="615" y="396" font-size="9" fill="#2e6760">可导入</text>
+    <rect x="94" y="428" width="584" height="54" rx="10" fill="#faf9f5"/><text x="112" y="451" font-size="11" font-weight="650">护肤观察局</text><text x="112" y="470" font-size="8" fill="#707772">微博 · 10 条近期内容 · 图片素材 3</text><text x="615" y="460" font-size="9" fill="#2e6760">可导入</text>
+    <rect x="94" y="492" width="584" height="54" rx="10" fill="#faf9f5"/><text x="112" y="515" font-size="11" font-weight="650">咖啡练习生</text><text x="112" y="534" font-size="8" fill="#707772">微博 · 7 条近期内容 · 日常记录</text><text x="615" y="524" font-size="9" fill="#2e6760">可导入</text>
+
+    <rect x="742" y="244" width="388" height="344" rx="16" fill="#eceae4"/>
+    <text x="770" y="281" font-size="11" font-weight="680">调查设置</text>
+    <text x="770" y="320" font-size="9" fill="#707772">调查目标</text><rect x="770" y="334" width="332" height="72" rx="10" fill="#faf9f5" stroke="#d8d6cf"/><text x="788" y="360" font-size="10">核查营销倾向，优先寻找反向证据，</text><text x="788" y="380" font-size="10">避免把普通创作者误判为营销运营。</text>
+    <text x="770" y="441" font-size="9" fill="#707772">负责人</text><text x="937" y="441" font-size="9" fill="#707772">业务优先级</text>
+    <rect x="770" y="453" width="150" height="34" rx="9" fill="#faf9f5" stroke="#d8d6cf"/><text x="786" y="475" font-size="10">本机管理员</text>
+    <rect x="936" y="453" width="166" height="34" rx="9" fill="#faf9f5" stroke="#d8d6cf"/><text x="952" y="475" font-size="10">高优先</text>
+    <circle cx="783" cy="521" r="7" fill="#2e6760"/><text x="800" y="525" font-size="10">导入后自动开始核查</text>
+    <rect x="770" y="540" width="332" height="34" rx="17" fill="#191d1c"/><text x="881" y="562" font-size="10" fill="#fff">创建 12 个调查</text>
+
+    <text x="70" y="640" font-size="10" fill="#707772">单次最多 200 个账号。执行容量不足时保留已导入任务，不丢数据，也不伪装成已经开始执行。</text>
+  </g>
+</svg>

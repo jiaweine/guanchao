@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <rect width="1200" height="720" rx="24" fill="#f2f0ea"/>
+  <rect x="26" y="26" width="1148" height="668" rx="18" fill="#faf9f5" stroke="#d8d6cf"/>
+  <path d="M26 88H1174M790 88V694" stroke="#d8d6cf"/>
+  <rect x="790" y="88" width="384" height="606" fill="#eceae4"/>
+  <g font-family="system-ui,-apple-system,'PingFang SC',sans-serif" fill="#191d1c">
+    <text x="48" y="63" font-size="21" font-weight="700">观潮</text><text x="350" y="61" font-size="12" fill="#707772">调查详情 · 证据核查</text>
+    <text x="54" y="126" font-size="10" fill="#707772">微博 · 好物研究所</text>
+    <text x="54" y="164" font-size="28" font-weight="720">好物研究所 · 内容调查</text>
+    <text x="54" y="192" font-size="12" fill="#707772">本轮要求：核查营销倾向，同时主动寻找反向证据。</text>
+
+    <text x="54" y="246" font-size="10" fill="#707772">你</text><text x="118" y="249" font-size="13" font-weight="600">重点看近期内容、主页身份与图片里的价格信息。</text>
+    <path d="M118 273H752" stroke="#d8d6cf"/>
+    <text x="54" y="316" font-size="10" fill="#707772">观潮</text>
+    <text x="118" y="316" font-size="12">当前判断为“明显营销倾向”，主要依据是持续转化表达与主页经营线索。</text>
+    <text x="118" y="340" font-size="12">同时存在个人使用体验这一反向线索，因此保留人工复核。</text>
+
+    <rect x="54" y="390" width="696" height="108" rx="14" fill="#fffdf9" stroke="#d8d6cf"/>
+    <text x="76" y="421" font-size="10" fill="#707772">已加入素材</text>
+    <rect x="76" y="442" width="132" height="32" rx="9" fill="#eeece6"/><text x="90" y="462" font-size="9">图片 · 价格截图</text>
+    <rect x="220" y="442" width="132" height="32" rx="9" fill="#eeece6"/><text x="234" y="462" font-size="9">视频 · 开箱片段</text>
+    <rect x="364" y="442" width="132" height="32" rx="9" fill="#eeece6"/><text x="378" y="462" font-size="9">音频 · 直播片段</text>
+    <rect x="508" y="442" width="132" height="32" rx="9" fill="#eeece6"/><text x="522" y="462" font-size="9">文档 · 合作备注</text>
+
+    <rect x="54" y="544" width="696" height="112" rx="14" fill="#fffdf9" stroke="#bdbbb3"/>
+    <text x="76" y="580" font-size="12" fill="#707772">继续追问、要求反向核查，或补充新素材…</text>
+    <text x="76" y="628" font-size="10" fill="#707772">＋ 添加素材 · 图片 · 视频 · 音频 · 文档</text>
+    <rect x="675" y="605" width="54" height="32" rx="16" fill="#191d1c"/><text x="691" y="626" font-size="10" fill="#fff">发送</text>
+
+    <text x="814" y="126" font-size="11" font-weight="700">证据</text><text x="865" y="126" font-size="11" fill="#707772">判断</text><text x="916" y="126" font-size="11" fill="#707772">素材</text><text x="967" y="126" font-size="11" fill="#707772">过程</text><text x="1018" y="126" font-size="11" fill="#707772">记录</text>
+    <path d="M814 142H842" stroke="#2e6760" stroke-width="2.5"/>
+
+    <text x="814" y="184" font-size="9" fill="#707772">支持判断</text>
+    <rect x="814" y="200" width="334" height="82" rx="12" fill="#faf9f5"/>
+    <text x="832" y="226" font-size="12" font-weight="680">跨内容转化压力持续</text><text x="832" y="249" font-size="9" fill="#707772">多条内容重复出现价格、评论区领取和主页橱窗。</text><text x="832" y="269" font-size="8" fill="#2e6760">强度 0.82</text>
+    <rect x="814" y="292" width="334" height="82" rx="12" fill="#faf9f5"/>
+    <text x="832" y="318" font-size="12" font-weight="680">主页长期经营线索清晰</text><text x="832" y="341" font-size="9" fill="#707772">简介持续出现合作、商务和经营身份表达。</text><text x="832" y="361" font-size="8" fill="#2e6760">强度 0.67</text>
+
+    <text x="814" y="408" font-size="9" fill="#707772">反向线索</text>
+    <rect x="814" y="424" width="334" height="92" rx="12" fill="#faf9f5" stroke="#d8d6cf"/>
+    <text x="832" y="451" font-size="12" font-weight="680">个人化表达仍然存在</text><text x="832" y="474" font-size="9" fill="#707772">部分内容包含具体经历、缺点和非模板化叙述。</text><text x="832" y="496" font-size="8" fill="#9a6558">反向强度 0.43</text>
+
+    <text x="814" y="554" font-size="9" fill="#707772">稳定性检查</text>
+    <text x="814" y="588" font-size="26" font-weight="720">78%</text><text x="884" y="588" font-size="9" fill="#707772">移除任一高影响内容后，结论仍保持同一方向。</text>
+    <path d="M814 610H1148" stroke="#d8d6cf"/><path d="M814 610H1075" stroke="#61746d" stroke-width="3"/>
+  </g>
+</svg>
