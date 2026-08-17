@@ -26,6 +26,23 @@ test('message and collaboration drafts stay isolated per case', () => {
   assert.equal(drafts.current(), 'case-a');
 });
 
+test('successful message and note writes consume only their matching drafts', () => {
+  const drafts = createDraftRegistry();
+  drafts.select('case-a');
+  drafts.update('case-a', { message: '已经发送的核查', note: '仍未发送的备注' });
+  drafts.consume('case-a', 'message');
+  assert.deepEqual(drafts.get('case-a'), { message: '', note: '仍未发送的备注' });
+  drafts.consume('case-a', 'note');
+  assert.deepEqual(drafts.get('case-a'), { message: '', note: '' });
+});
+
+test('failed writes can leave drafts intact for retry', () => {
+  const drafts = createDraftRegistry();
+  drafts.select('case-a');
+  drafts.update('case-a', { message: '网络失败后要保留', note: '备注也保留' });
+  assert.deepEqual(drafts.get('case-a'), { message: '网络失败后要保留', note: '备注也保留' });
+});
+
 test('clearing a deleted current case removes its drafts and selection', () => {
   const drafts = createDraftRegistry();
   drafts.select('case-a');

@@ -42,6 +42,12 @@ export function createDraftRegistry(limit = 50) {
       if (!caseId) return;
       store(caseId, value);
     },
+    consume(caseId, field) {
+      if (!caseId || !['message', 'note'].includes(field)) return;
+      const draft = cleanDraft(drafts.get(caseId) || EMPTY_DRAFT);
+      draft[field] = '';
+      store(caseId, draft);
+    },
     clear(caseId) {
       if (!caseId) return;
       drafts.delete(caseId);
@@ -135,6 +141,13 @@ function isCaseReport(meta) {
   return meta.method === 'GET' && /^\/api\/cases\/[^/]+\/report$/.test(meta.url.pathname);
 }
 
+function successfulDraftField(meta, response) {
+  if (!response.ok || meta.method !== 'POST') return '';
+  if (/^\/api\/cases\/[^/]+\/messages$/.test(meta.url.pathname)) return 'message';
+  if (/^\/api\/cases\/[^/]+\/comments$/.test(meta.url.pathname)) return 'note';
+  return '';
+}
+
 export function installCaseContextGuards({ windowRef = window, documentRef = document } = {}) {
   const registry = createDraftRegistry();
   const initialCaseId = currentCaseIdFromHref(windowRef.location.href);
@@ -169,6 +182,9 @@ export function installCaseContextGuards({ windowRef = window, documentRef = doc
   windowRef.fetch = async (input, init = {}) => {
     const meta = requestMeta(input, init, windowRef.location.href);
     const response = await downstreamFetch(input, init);
+    const requestCaseId = caseIdFromRequest(meta);
+    const consumedField = successfulDraftField(meta, response);
+    if (consumedField && requestCaseId) registry.consume(requestCaseId, consumedField);
 
     if (isCaseDetailRequest(meta) && response.ok) {
       const snapshot = await response.clone().json().catch(() => ({}));
@@ -177,16 +193,15 @@ export function installCaseContextGuards({ windowRef = window, documentRef = doc
         applyDraft(documentRef, restored);
       }
     } else if (isCaseDelete(meta) && response.ok) {
-      const deletedCaseId = caseIdFromRequest(meta);
-      if (deletedCaseId) {
-        const wasCurrent = registry.current() === deletedCaseId;
-        registry.clear(deletedCaseId);
+      if (requestCaseId) {
+        const wasCurrent = registry.current() === requestCaseId;
+        registry.clear(requestCaseId);
         if (wasCurrent) applyDraft(documentRef, EMPTY_DRAFT);
       }
     }
 
     if (isCaseReport(meta) && response.ok) {
-      return guardCaseBoundBlob(response, caseIdFromRequest(meta), () => registry.current());
+      return guardCaseBoundBlob(response, requestCaseId, () => registry.current());
     }
     return response;
   };
