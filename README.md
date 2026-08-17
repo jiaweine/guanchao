@@ -1,33 +1,35 @@
 <h1 align="center">观潮 · Guanchao</h1>
 
-<p align="center"><strong>面向内容平台、品牌安全、舆情与审核团队的多模态账号调查 Agent Harness</strong></p>
-<p align="center">批量调查 · 证据研判 · 稳定性核查 · 人工复核 · 持续观察 · 受控学习</p>
+<p align="center"><strong>面向社交平台账号与内容的多模态调查 Agent</strong></p>
+<p align="center">批量调查 · 风险研判 · 证据核查 · 人工复核 · 持续观察 · 受控学习</p>
 
-![观潮产品工作台矢量预览](docs/product-preview.svg)
+![观潮产品工作台矢量预览的兼容渲染图](docs/product-preview.png)
 
 观潮不是“给微博账号打一个营销分”的单点分类器。它把账号主页、近期内容、图片、视频、音频和文档放进同一调查上下文，由自己的 Harness 决定哪些证据最值得继续核查、什么时候应该寻找反向证据、结论是否被少数内容支配，以及当前资料是否已经足够进入人工复核。
 
-> **产品边界**：商业内容不等于违规。观潮辅助调查、排序、证据整理和人工复核，不自动处罚、举报、封禁或做事实定性。
+> **产品边界**：商业内容不等于违规。观潮辅助账号调查、风险研判、证据整理和人工复核，不自动处罚、举报、封禁或做事实定性。
 
 ## 产品工作台
 
 ### 批量调查
 
-![观潮批量账号调查矢量图](docs/product-batch.svg)
+![观潮批量账号调查矢量图的兼容渲染图](docs/product-batch.png)
 
 单次可导入最多 200 个账号，支持 JSON、CSV 与直接粘贴。每个账号拥有独立的运行、证据、人工复核和监测状态；执行容量不足时保留已导入任务，不丢数据，也不会假装已经开始核查。
 
 ### 复核队列
 
-![观潮人工复核队列矢量图](docs/product-review-queue.svg)
+![观潮人工复核队列矢量图的兼容渲染图](docs/product-review-queue.png)
 
 队列综合业务优先级、营销倾向、隐性推广风险、把握度、稳定性和资料缺口计算复核价值。人工复核支持 `普通创作者 / 无法判断 / 营销运营` 三态，并支持键盘连续复核。
 
 ### 证据工作区
 
-![观潮证据工作区矢量图](docs/product-evidence.svg)
+![观潮证据工作区矢量图的兼容渲染图](docs/product-evidence.png)
 
 支持判断依据、反向线索和待补资料分开呈现。多模态素材中的文字只属于证据，不能成为改变 Agent 权限或决策策略的指令。
+
+> README 为兼容 GitHub 网页、移动端与不同 Markdown 客户端，使用 PNG 渲染版本展示产品图；可编辑矢量源仍保留为 [`product-preview.svg`](docs/product-preview.svg)、[`product-batch.svg`](docs/product-batch.svg)、[`product-review-queue.svg`](docs/product-review-queue.svg) 和 [`product-evidence.svg`](docs/product-evidence.svg)。这些图是产品矢量预览，不是截图。
 
 ## 核心算法
 
@@ -43,9 +45,9 @@
 - [`guanchao/policy.py`](guanchao/policy.py)：基于期望信息价值的 Owned Policy
 - [`guanchao/evolution.py`](guanchao/evolution.py)：分层交叉回放、trust-region 校准和回归门控
 
-### 1. 硬编码被拆成“先验”和“可学习参数”
+### 1. 硬编码被拆成先验与可学习参数
 
-完全消灭常数既不现实，也不是好算法设计。观潮现在只把**证据传感器、数值安全区间、权限和成案 guardrail**作为确定性约束；真正影响业务判断的参数进入 `Calibration`，包括主效应权重、交互权重、temperature、decision threshold、abstain margin 和高风险阈值，并可由人工复核数据在回放门槛内更新。
+完全消灭常数既不现实，也不是好算法设计。观潮只把**证据传感器、数值安全区间、权限和成案 guardrail**作为确定性约束；真正影响业务判断的参数进入 `Calibration`，包括主效应权重、交互权重、temperature、decision threshold、abstain margin 和高风险阈值，并可由人工复核数据在回放门槛内更新。
 
 因此，代码里的冷启动参数是 prior，不是不可改变的最终答案。
 
@@ -61,7 +63,7 @@ L(h,n)=
 }{1+z^2/n}
 $$
 
-随后结合帖内重复密度和样本支持度得到稳健证据率。单帖偶然命中会被收缩，跨内容持续出现的转化信号才逐渐获得更高权重。
+单帖偶然命中会被收缩，跨内容持续出现的转化信号才逐渐获得更高权重。
 
 ### 3. 主效应与非线性交互联合评分
 
@@ -71,16 +73,14 @@ $$
 z=b+\sum_{i=1}^{d}w_i f_i+\sum_{j=1}^{m}v_j\phi_j(\mathbf f)
 $$
 
-交互项采用有界乘积，例如：
+例如：
 
 $$
-\phi_{\mathrm{intent\text{-}action}}
-=f_{\mathrm{commercial}}f_{\mathrm{cta}}
+\phi_{\mathrm{intent\text{-}action}}=f_{\mathrm{commercial}}f_{\mathrm{cta}}
 $$
 
 $$
-\phi_{\mathrm{profile\text{-}conversion}}
-=f_{\mathrm{profile}}f_{\mathrm{cross\text{-}post}}
+\phi_{\mathrm{profile\text{-}conversion}}=f_{\mathrm{profile}}f_{\mathrm{cross\text{-}post}}
 $$
 
 同时保留 `commercial_authentic` 负向交互，避免“提到品牌 + 有真实体验细节”被简单当成更强营销证据。最终概率使用 temperature calibration：
@@ -101,17 +101,16 @@ $$
 语义老师对每个信号必须返回原文 quote。只有 quote 能在当前 bio、帖子或素材中逐字核对时，该信号才允许进入融合：
 
 $$
-f_k^{*}=
-\frac{f_k+\lambda g s_k}{1+\lambda g}
+f_k^{*}=\frac{f_k+\lambda g s_k}{1+\lambda g}
 $$
 
 $s_k$ 是模型建议的证据强度，$g$ 是引用通过验证的比例，$\lambda$ 是可控 teacher weight。无法核验的高分建议会被直接丢弃。
 
-当前默认开放模型配置使用 `Qwen/Qwen3.6-35B-A3B` 作为文本/视觉语义证据服务；需要统一音频、图片、视频理解时，可在部署侧使用 Qwen3-Omni 作为感知服务。不开启外部模型时，系统仍可完整运行确定性证据与自研 Harness。
+当前可选开放模型配置使用 `Qwen/Qwen3.6-35B-A3B` 作为文本/视觉语义证据服务；需要统一音频、图片、视频理解时，可在部署侧使用 Qwen3-Omni 作为感知服务。不开启外部模型时，系统仍可完整运行确定性证据与自研 Harness。
 
 ### 5. Leave-One-Out 反事实稳定性
 
-单条品牌合作、爆款或异常内容可能把账号推到错误一侧。观潮把结论稳定性作为独立变量。设完整样本结果为 $p_0$，依次移除第 $i$ 条内容后的结果为 $p_{-i}$：
+单条品牌合作、爆款或异常内容可能把账号推到错误一侧。设完整样本结果为 $p_0$，依次移除第 $i$ 条内容后的结果为 $p_{-i}$：
 
 $$
 \Delta_{\max}=\max_i |p_{-i}-p_0|
@@ -125,19 +124,19 @@ $$
 S_{\mathrm{stab}}=\exp(-3.6I)
 $$
 
-稳定性探针故意不调用外部语义老师，避免在反事实循环中把模型随机性误认为账号本身的不稳定。样本越多，单条内容允许拥有的最大杠杆越低。
+稳定性探针故意不调用外部语义老师，避免在反事实循环中把模型随机性误认为账号本身的不稳定。
 
 ### 6. 把握度与选择性拒判
 
-分类概率不等于“把握度”。观潮单独组合样本覆盖、资料渠道完整度、距离决策边界的分离度和反事实稳定性：
+分类概率不等于把握度。观潮单独组合样本覆盖、资料渠道完整度、距离决策边界的分离度和反事实稳定性：
 
 $$
-C_{\mathrm{final}}
-=C_{\mathrm{evidence}}(n,M,|P_{\mathrm{mkt}}-0.5|)
+C_{\mathrm{final}}=
+C_{\mathrm{evidence}}(n,M,|P_{\mathrm{mkt}}-0.5|)
 \cdot(0.70+0.30S_{\mathrm{stab}})
 $$
 
-当概率接近学习到的 decision threshold，或稳定性/把握度下降时，系统扩大 abstain band，主动输出灰区或资料不足，而不是为了覆盖率强迫二元判断。拒判带宽本身也可以在回放数据上搜索。
+当概率接近学习到的 decision threshold，或稳定性、把握度下降时，系统扩大 abstain band，主动输出灰区或资料不足，而不是为了覆盖率强迫二元判断。
 
 ### 7. 隐性推广风险与营销倾向分开
 
@@ -152,23 +151,20 @@ P_{\mathrm{mkt}}
 \right)
 $$
 
-$D$ 是披露信号，$C$ 是联系方式/导流压力。
+$D$ 是披露信号，$C$ 是联系方式与导流压力。
 
 ### 8. Owned Policy：期望信息增益减去观察成本
 
-Agent 不再依赖 `100 / 92 / 78 / 64` 这类大常数决定工具顺序。除首次建立资料范围和内容基线外，后续动作统一比较归一化效用：
+Agent 不再依赖一组大常数决定工具顺序。除首次建立资料范围和内容基线外，后续动作统一比较归一化效用：
 
 $$
 U(a\mid s)=G(a\mid s)-\lambda_c C(a)
 $$
 
-$G$ 综合当前不确定性、决策边界接近度、样本支持、稳定性、已有证据和任务是否要求谨慎；$C(a)$ 是工具观察成本。
-
 例如反向证据挑战的核心增益可写成：
 
 $$
-U_{\mathrm{challenge}}
-\propto
+U_{\mathrm{challenge}}\propto
 \max(1-C_{\mathrm{final}},B)+\gamma I_{\mathrm{cautious}}
 $$
 
@@ -238,7 +234,7 @@ $$
 
 ## 质量与性能验证
 
-当前自动检查包含 Python 编译、前端 JavaScript 语法和完整 Pytest 回归。算法质量测试还包含 20 个未用于参数调整的微博风格 holdout 场景，覆盖课程导流、门店预约、软链联盟、矩阵经营、品牌合作，以及经济研究、消费者维权、课程教学和个人测评等容易误判的负类。
+当前自动检查包含 Python 编译、前端 JavaScript 语法、交互状态回归和完整 Pytest 回归。算法质量测试还包含 20 个未用于参数调整的微博风格 holdout 场景，覆盖课程导流、门店预约、软链联盟、矩阵经营、品牌合作，以及经济研究、消费者维权、课程教学和个人测评等容易误判的负类。
 
 | 算法 | Ranking AUC | 默认阈值准确率 |
 | --- | ---: | ---: |
@@ -247,7 +243,7 @@ $$
 
 这只是**小型人工构造的回归 holdout**，不是公开真实世界微博数据集，因此不能解释成线上准确率 100%。真实部署应继续用客户人工复核数据统计 Precision、Recall、Overturn Rate、拒判覆盖率和 calibration。
 
-压力测试使用与待发布代码同源的本地单机实例，未开启外部语义模型服务，结果仅作工程参考，**不是生产 SLA**：
+最近一次与正式代码同源的本地单机压力结果仅作工程参考，**不是生产 SLA**：
 
 | 场景 | 重复测试结果 |
 | --- | --- |
@@ -292,7 +288,7 @@ export GUANCHAO_VISION_MODEL=Qwen/Qwen3.6-35B-A3B
 
 | 文件 | 职责 |
 | --- | --- |
-| `frontend/` | 调查工作台、批量入口、复核队列和治理界面 |
+| `frontend/` | 调查工作台、批量入口与复核队列 |
 | `guanchao/api.py` | HTTP API、权限边界和输入校验 |
 | `guanchao/detection.py` | 评分、语义融合、稳定性和缓存 |
 | `guanchao/detection_support.py` | 证据传感器、Wilson 收缩和交互函数 |

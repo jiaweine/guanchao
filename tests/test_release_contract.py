@@ -55,15 +55,31 @@ def test_list_and_review_queue_use_compact_summaries(tmp_path):
     assert detail["runs"][0]["state"]["primary_result"]["features"]
 
 
-def test_readme_presents_product_images_and_owned_algorithm_math_without_arrow_flowchart():
+def test_readme_presents_png_renders_and_keeps_vector_sources():
     text = Path("README.md").read_text(encoding="utf-8")
-    for image in [
+    png_images = [
+        "docs/product-preview.png",
+        "docs/product-batch.png",
+        "docs/product-review-queue.png",
+        "docs/product-evidence.png",
+    ]
+    svg_sources = [
         "docs/product-preview.svg",
         "docs/product-batch.svg",
         "docs/product-review-queue.svg",
         "docs/product-evidence.svg",
-    ]:
+    ]
+    for image in png_images:
         assert image in text
+        path = Path(image)
+        assert path.is_file()
+        assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    for source in svg_sources:
+        assert source in text
+        assert Path(source).is_file()
+    for markdown_image in [line for line in text.splitlines() if line.startswith("![")]:
+        assert ".svg)" not in markdown_image
+
     for formula_token in [
         "P_{\\mathrm{mkt}}",
         "S_{\\mathrm{stab}}",
