@@ -11,5 +11,6 @@ check:
 	node --check frontend/app-core.js
 	node --check frontend/runtime.mjs
 	node --check frontend/interaction.mjs
-	node --test tests/test_runtime.mjs
+	node --check frontend/creation.mjs
+	node --test tests/test_runtime.mjs tests/test_creation.mjs
 	python -m pytest -q

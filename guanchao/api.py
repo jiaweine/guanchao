@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import time
@@ -48,7 +49,7 @@ def _serialize_case_mutation(path: str, method: str, case_id: str | None) -> boo
     return True
 
 
-def _idempotency_scope(request: Request) -> str | None:
+def _idempotency_base(request: Request) -> str | None:
     if request.method.upper() != 'POST' or request.url.path not in {'/api/cases', '/api/cases/batch'}:
         return None
     key = (request.headers.get('X-Guanchao-Request-Key') or '').strip()[:160]
@@ -81,8 +82,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app = create_core_app(db_path)
     case_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
     idempotency_guard = asyncio.Lock()
-    idempotency_cache: OrderedDict[str, tuple[float, tuple[int, dict[str, str], bytes]]] = OrderedDict()
-    idempotency_inflight: dict[str, asyncio.Future[tuple[int, dict[str, str], bytes] | None]] = {}
+    idempotency_cache: OrderedDict[
+        str, tuple[float, str, tuple[int, dict[str, str], bytes]]
+    ] = OrderedDict()
+    idempotency_inflight: dict[
+        str, tuple[str, asyncio.Future[tuple[int, dict[str, str], bytes] | None]]
+    ] = {}
     perception_slots = asyncio.Semaphore(max(1, int(os.getenv('GUANCHAO_PERCEPTION_WORKERS', '4'))))
 
     def lock_for(case_id: str) -> asyncio.Lock:
@@ -93,27 +98,39 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return lock
 
     def prune_idempotency_cache(now: float) -> None:
-        expired = [key for key, (created, _) in idempotency_cache.items() if now - created > IDEMPOTENCY_TTL_SECONDS]
+        expired = [key for key, (created, _, _) in idempotency_cache.items() if now - created > IDEMPOTENCY_TTL_SECONDS]
         for key in expired:
             idempotency_cache.pop(key, None)
         while len(idempotency_cache) > IDEMPOTENCY_CACHE_LIMIT:
             idempotency_cache.popitem(last=False)
 
-    async def idempotent_call(scope: str, action: Any) -> Response:
+    async def idempotent_call(base: str, digest: str, action: Any) -> Response:
         while True:
             owner = False
             async with idempotency_guard:
                 now = time.monotonic()
                 prune_idempotency_cache(now)
-                cached = idempotency_cache.get(scope)
+                cached = idempotency_cache.get(base)
                 if cached:
-                    idempotency_cache.move_to_end(scope)
-                    return _response_from_record(cached[1])
-                future = idempotency_inflight.get(scope)
-                if future is None:
+                    if cached[1] != digest:
+                        return JSONResponse(
+                            status_code=409,
+                            content={'detail': '同一个请求标识不能提交不同的调查内容'},
+                        )
+                    idempotency_cache.move_to_end(base)
+                    return _response_from_record(cached[2])
+                inflight = idempotency_inflight.get(base)
+                if inflight is None:
                     future = asyncio.get_running_loop().create_future()
-                    idempotency_inflight[scope] = future
+                    idempotency_inflight[base] = (digest, future)
                     owner = True
+                else:
+                    inflight_digest, future = inflight
+                    if inflight_digest != digest:
+                        return JSONResponse(
+                            status_code=409,
+                            content={'detail': '同一个请求标识不能提交不同的调查内容'},
+                        )
             if owner:
                 break
             record = await future
@@ -125,19 +142,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
             record = await _record_response(response)
         except BaseException:
             async with idempotency_guard:
-                waiter = idempotency_inflight.pop(scope, None)
-                if waiter and not waiter.done():
-                    waiter.set_result(None)
+                inflight = idempotency_inflight.pop(base, None)
+                if inflight and not inflight[1].done():
+                    inflight[1].set_result(None)
             raise
 
         async with idempotency_guard:
             if 200 <= record[0] < 300:
-                idempotency_cache[scope] = (time.monotonic(), record)
-                idempotency_cache.move_to_end(scope)
+                idempotency_cache[base] = (time.monotonic(), digest, record)
+                idempotency_cache.move_to_end(base)
                 prune_idempotency_cache(time.monotonic())
-            waiter = idempotency_inflight.pop(scope, None)
-            if waiter and not waiter.done():
-                waiter.set_result(record)
+            inflight = idempotency_inflight.pop(base, None)
+            if inflight and not inflight[1].done():
+                inflight[1].set_result(record)
         return _response_from_record(record)
 
     async def upload_asset_without_blocking_loop(
@@ -269,10 +286,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     return await dispatch()
             return await dispatch()
 
-        scope = _idempotency_scope(request)
-        if scope:
-            await request.body()
-            return await idempotent_call(scope, serialized_dispatch)
+        base = _idempotency_base(request)
+        if base:
+            body = await request.body()
+            digest = hashlib.sha256(body).hexdigest()
+            return await idempotent_call(base, digest, serialized_dispatch)
         return await serialized_dispatch()
 
     return app
