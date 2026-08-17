@@ -1,5 +1,4 @@
-"""Guanchao: evidence-first social account investigation harness."""
+"""Guanchao — evidence-first social account investigation harness."""
 
-from .api import create_app
-
-__all__ = ["create_app"]
+__all__ = ["__version__"]
+__version__ = "0.1.0"

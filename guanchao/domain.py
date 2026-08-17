@@ -5,10 +5,20 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 Platform = Literal["xiaohongshu", "weibo", "douyin", "bilibili", "other"]
+AssetKind = Literal["image", "video", "audio", "document", "other"]
+AssetStatus = Literal["pending", "ready", "error"]
+_ALLOWED_PLATFORMS = {"xiaohongshu", "weibo", "douyin", "bilibili", "other"}
 
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 @dataclass(slots=True)
@@ -24,15 +34,18 @@ class PostSnapshot:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], index: int = 0) -> "PostSnapshot":
+        if not isinstance(raw, dict):
+            raise TypeError("post must be an object")
+        stamp = raw.get("published_at") or raw.get("timestamp")
         return cls(
             id=str(raw.get("id") or f"post-{index + 1}"),
             text=str(raw.get("text") or raw.get("caption") or raw.get("title") or "").strip(),
-            published_at=(str(raw.get("published_at") or raw.get("timestamp")) if (raw.get("published_at") or raw.get("timestamp")) is not None else None),
-            likes=max(0, int(raw.get("likes") or 0)),
-            comments=max(0, int(raw.get("comments") or 0)),
-            shares=max(0, int(raw.get("shares") or 0)),
-            views=max(0, int(raw.get("views") or 0)),
-            url=raw.get("url"),
+            published_at=str(stamp) if stamp is not None else None,
+            likes=_safe_int(raw.get("likes")),
+            comments=_safe_int(raw.get("comments")),
+            shares=_safe_int(raw.get("shares")),
+            views=_safe_int(raw.get("views")),
+            url=str(raw.get("url")) if raw.get("url") else None,
         )
 
 
@@ -50,21 +63,49 @@ class AccountSnapshot:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "AccountSnapshot":
+        if not isinstance(raw, dict):
+            raise TypeError("account must be an object")
         posts_raw = raw.get("posts") or []
+        if not isinstance(posts_raw, list):
+            raise TypeError("posts must be a list")
+        platform = str(raw.get("platform") or "other").strip().lower()
+        if platform not in _ALLOWED_PLATFORMS:
+            platform = "other"
         return cls(
-            platform=raw.get("platform", "other"),
-            handle=str(raw.get("handle") or raw.get("account") or "unknown").strip(),
+            platform=platform,  # type: ignore[arg-type]
+            handle=str(raw.get("handle") or raw.get("account") or "unknown").strip() or "unknown",
             display_name=str(raw.get("display_name") or raw.get("name") or "").strip(),
             bio=str(raw.get("bio") or "").strip(),
-            followers=max(0, int(raw.get("followers") or 0)),
-            following=max(0, int(raw.get("following") or 0)),
+            followers=_safe_int(raw.get("followers")),
+            following=_safe_int(raw.get("following")),
             verified=bool(raw.get("verified") or False),
-            profile_url=raw.get("profile_url") or raw.get("url"),
+            profile_url=str(raw.get("profile_url") or raw.get("url")) if (raw.get("profile_url") or raw.get("url")) else None,
             posts=[PostSnapshot.from_dict(item, i) for i, item in enumerate(posts_raw)],
         )
 
     def asdict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class AssetSnapshot:
+    id: str
+    case_id: str
+    name: str
+    kind: AssetKind
+    content_type: str
+    size: int
+    status: AssetStatus = "pending"
+    extracted_text: str = ""
+    note: str = ""
+    error: str = ""
+    created_at: str = field(default_factory=utcnow_iso)
+
+    def asdict(self, include_text: bool = True) -> dict[str, Any]:
+        payload = asdict(self)
+        if not include_text:
+            payload.pop("extracted_text", None)
+        return payload
 
 
 @dataclass(slots=True)
@@ -75,6 +116,7 @@ class Evidence:
     strength: float
     direction: Literal["supports", "against", "context"] = "supports"
     post_ids: list[str] = field(default_factory=list)
+    asset_ids: list[str] = field(default_factory=list)
 
     def asdict(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,6 +134,8 @@ class FeatureVector:
     cross_post_pressure: float = 0.0
     disclosure_signal: float = 0.0
     authentic_variation: float = 0.0
+    media_commerciality: float = 0.0
+    identity_consistency: float = 0.0
 
     def asdict(self) -> dict[str, float]:
         return asdict(self)
@@ -102,6 +146,7 @@ class DetectionResult:
     marketing_likelihood: float
     covert_promotion_risk: float
     confidence: float
+    stability: float
     label: str
     summary: str
     features: FeatureVector
@@ -109,8 +154,7 @@ class DetectionResult:
     missing: list[str] = field(default_factory=list)
 
     def asdict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        return payload
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -143,14 +187,8 @@ class RunEvent:
     status: Literal["working", "done", "warning", "error"] = "done"
 
     @classmethod
-    def create(
-        cls,
-        kind: str,
-        title: str,
-        detail: str = "",
-        tool: str | None = None,
-        status: Literal["working", "done", "warning", "error"] = "done",
-    ) -> "RunEvent":
+    def create(cls, kind: str, title: str, detail: str = "", tool: str | None = None,
+               status: Literal["working", "done", "warning", "error"] = "done") -> "RunEvent":
         return cls(at=utcnow_iso(), kind=kind, title=title, detail=detail, tool=tool, status=status)
 
     def asdict(self) -> dict[str, Any]:

@@ -1,9 +1,7 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
 .venv/
-.env
+__pycache__/
+.pytest_cache/
+*.pyc
 *.db
-*.db-shm
-*.db-wal
-.DS_Store
+.guanchao-assets/
+.env

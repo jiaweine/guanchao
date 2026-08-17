@@ -1,21 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=70", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "guanchao"
-version = "0.1.0"
-description = "Evidence-first agent harness for social account marketing-pattern investigations"
+dynamic = ["version"]
 requires-python = ">=3.11"
-dependencies = [
-  "fastapi>=0.115",
-  "uvicorn>=0.30",
-  "pydantic>=2.8",
-]
+dependencies = ["fastapi>=0.115", "uvicorn>=0.30", "pydantic>=2.8", "httpx>=0.27", "python-multipart>=0.0.9"]
 
-[project.optional-dependencies]
-test = ["pytest>=8", "httpx>=0.27"]
+[tool.setuptools.dynamic]
+version = {attr = "guanchao.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"

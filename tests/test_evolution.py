@@ -1,35 +1,19 @@
 from guanchao.detection import Calibration
 from guanchao.domain import FeatureVector
-from guanchao.evolution import EvolutionEngine, LabeledExample
+from guanchao.evolution import EvolutionEngine,LabeledExample
+from guanchao.policy import PolicyProfile
 
 
-def fv(base: float, authentic: float = 0.05) -> FeatureVector:
-    return FeatureVector(
-        commercial_language=base,
-        call_to_action=base,
-        contact_pressure=max(0, base - 0.15),
-        template_reuse=base,
-        cadence_burst=base * 0.7,
-        engagement_pattern=base * 0.4,
-        profile_commerciality=base * 0.8,
-        cross_post_pressure=base,
-        disclosure_signal=base * 0.3,
-        authentic_variation=authentic,
-    )
+def make(i,label):
+    base=.78 if label else .12
+    return LabeledExample(FeatureVector(commercial_language=base,call_to_action=base,contact_pressure=base*.7,template_reuse=base*.7,profile_commerciality=base*.8,authentic_variation=.1 if label else .75),label,f"case-{i}")
 
 
-def test_evolution_is_gated_and_bounded():
-    examples = []
-    for i in range(14):
-        examples.append(LabeledExample(fv(0.75 + (i % 3) * 0.04), 1))
-        examples.append(LabeledExample(fv(0.08 + (i % 3) * 0.03, authentic=0.75), 0))
-    current = Calibration(bias=-0.4)
-    report = EvolutionEngine().evolve(current, examples)
-    assert report.examples == len(examples)
-    assert -4.5 <= report.calibration.bias <= 1.0
-    assert report.candidate_score >= report.baseline_score or not report.accepted
+def test_evolution_requires_enough_feedback():
+    r=EvolutionEngine().evolve(Calibration(),[make(i,i%2) for i in range(6)],PolicyProfile()); assert not r.accepted and r.examples==6
 
 
-def test_evolution_refuses_too_little_feedback():
-    report = EvolutionEngine().evolve(Calibration(), [LabeledExample(fv(0.8), 1)] * 3)
-    assert not report.accepted
+def test_cross_validated_evolution_returns_bounded_report():
+    examples=[make(i,i%2) for i in range(30)]; r=EvolutionEngine().evolve(Calibration(),examples,PolicyProfile())
+    assert r.examples==30 and -1<=r.worst_fold_delta<=1
+    assert .66<=r.policy_profile.challenge_confidence<=.86
