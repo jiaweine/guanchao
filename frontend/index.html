@@ -11,21 +11,27 @@
 <div class="app-shell" id="appShell">
   <header class="topbar">
     <a class="brand" href="/" aria-label="观潮首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span><strong>观潮</strong><small>内容调查工作台</small></span></a>
-    <div class="top-context"><span class="live-dot"></span><span>工作空间可用</span><span class="top-sep"></span><span>文本 · 图片 · 视频 · 音频 · 文档</span></div>
+    <div class="top-context"><span class="live-dot"></span><span>工作空间可用</span><span class="top-sep"></span><span id="queueSummary">待复核 0</span><span class="top-sep"></span><span>文本 · 图片 · 视频 · 音频 · 文档</span></div>
     <div class="top-actions"><button class="quiet-action" id="demoBtn">载入示例</button><button class="primary-action" id="newCaseBtn">新建调查</button></div>
   </header>
 
   <aside class="case-rail">
-    <div class="rail-heading"><span>调查</span><button id="refreshCases" aria-label="刷新调查列表">刷新</button></div>
+    <div class="rail-heading"><span id="listTitle">待复核</span><button id="listModeBtn" aria-label="切换调查列表">查看全部</button></div>
     <button class="new-case-row" id="newCaseRailBtn"><span>＋</span><b>新建调查</b></button>
-    <div class="case-list" id="caseList"><div class="case-empty"><strong>还没有调查</strong><p>从一个账号、一组内容或几份素材开始。</p></div></div>
-    <div class="rail-foot"><span class="live-dot"></span><div><b>证据优先</b><small>资料不足时保留不确定性，不强行下结论。</small></div></div>
+    <div class="case-list" id="caseList"><div class="case-empty"><strong>正在读取</strong><p>正在整理需要人工确认的调查。</p></div></div>
+    <div class="rail-foot"><span class="live-dot"></span><div><b>证据优先</b><small>优先处理尚未人工确认的结论；资料不足时允许保留“无法判断”。</small></div></div>
   </aside>
 
   <main class="workspace" id="workspace">
     <section class="workspace-head">
       <div class="workspace-title"><span class="eyebrow" id="casePlatform">跨平台调查</span><h1 id="caseTitle">查清一个账号，不只看一条内容。</h1><p id="caseMeta">给出目标和现有资料。系统会自己决定先看什么、哪里需要反向核对，以及什么时候证据足够。</p></div>
-      <div class="review-actions" id="workspaceActions" hidden><span>人工复核</span><button id="markNormalBtn">普通创作者</button><button class="danger-soft" id="markMarketingBtn">营销运营</button></div>
+      <div class="review-actions" id="workspaceTools" hidden>
+        <button id="deleteCaseBtn">删除调查</button>
+        <span id="reviewHint">人工复核</span>
+        <button id="markNormalBtn">普通创作者</button>
+        <button id="markUncertainBtn">无法判断</button>
+        <button class="danger-soft" id="markMarketingBtn">营销运营</button>
+      </div>
     </section>
 
     <section class="conversation" id="conversation">

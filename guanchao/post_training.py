@@ -5,24 +5,54 @@ from typing import Any
 
 
 class PostTrainingCorpusBuilder:
-    """Build harness-aware SFT/preference records from verified trajectories without coupling the runtime to a trainer."""
+    """Build reviewed investigation trajectories without coupling runtime code to a trainer."""
 
-    def build_jsonl(self, cases: list[dict[str, Any]], feedback: list[dict[str, Any]]) -> str:
-        labels={row["case_id"]:int(row["label"]) for row in feedback}
-        records=[]
+    def build_jsonl(self, cases: list[dict[str, Any]], reviews: list[dict[str, Any]]) -> str:
+        review_by_run = {
+            row["run_id"]: row
+            for row in reviews
+            if row.get("run_id") and row.get("decision") in {"confirm_ordinary", "confirm_marketing"}
+        }
+        records: list[str] = []
+
         for case in cases:
-            if case["id"] not in labels: continue
-            completed=next((r for r in case.get("runs",[]) if r["status"]=="completed"),None)
-            if not completed: continue
-            state=completed["state"]
-            record={
-                "task":"social_account_investigation",
-                "goal":state.get("goal",case.get("goal","")),
-                "observations":{"targets":state.get("targets",[]),"assets":[{k:v for k,v in a.items() if k!="storage_path"} for a in state.get("assets",[])]},
-                "trajectory":[{"kind":e.get("kind"),"tool":e.get("tool"),"status":e.get("status"),"detail":e.get("detail")} for e in state.get("events",[])],
-                "answer":state.get("answer",""),
-                "human_label":labels[case["id"]],
-                "reward":1,
-            }
-            records.append(json.dumps(record,ensure_ascii=False))
-        return "\n".join(records)+("\n" if records else "")
+            for run in case.get("runs") or []:
+                if run.get("status") != "completed":
+                    continue
+                review = review_by_run.get(run.get("id"))
+                if not review:
+                    continue
+                state = run.get("state") or {}
+                decision = review["decision"]
+                record = {
+                    "task": "social_account_investigation",
+                    "case_id": case.get("id"),
+                    "run_id": run.get("id"),
+                    "goal": state.get("goal", case.get("goal", "")),
+                    "observations": {
+                        "targets": state.get("targets", []),
+                        "assets": [
+                            {key: value for key, value in asset.items() if key != "storage_path"}
+                            for asset in state.get("assets", [])
+                        ],
+                    },
+                    "trajectory": [
+                        {
+                            "kind": event.get("kind"),
+                            "tool": event.get("tool"),
+                            "status": event.get("status"),
+                            "detail": event.get("detail"),
+                        }
+                        for event in state.get("events", [])
+                    ],
+                    "answer": state.get("answer", ""),
+                    "human_label": 1 if decision == "confirm_marketing" else 0,
+                    "review": {
+                        "decision": decision,
+                        "reason": review.get("reason", ""),
+                        "note": review.get("note", ""),
+                    },
+                }
+                records.append(json.dumps(record, ensure_ascii=False))
+
+        return "\n".join(records) + ("\n" if records else "")
