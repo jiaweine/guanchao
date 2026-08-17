@@ -92,11 +92,23 @@ class EvolutionEngine:
             else "候选没有同时通过逐折零退化、整体提升与双类召回保护"
         )
         return EvolutionReport(
-            accepted, baseline_score, candidate_score, worst, len(examples), reason,
-            best if accepted else current, policy,
+            accepted,
+            baseline_score,
+            candidate_score,
+            worst,
+            len(examples),
+            reason,
+            best if accepted else current,
+            policy,
         )
 
-    def _reject(self, current: Calibration, policy: PolicyProfile, examples: list[LabeledExample], reason: str) -> EvolutionReport:
+    def _reject(
+        self,
+        current: Calibration,
+        policy: PolicyProfile,
+        examples: list[LabeledExample],
+        reason: str,
+    ) -> EvolutionReport:
         return EvolutionReport(False, 0.0, 0.0, 0.0, len(examples), reason, current, policy)
 
     @staticmethod
@@ -104,7 +116,7 @@ class EvolutionEngine:
         folds = [[] for _ in range(k)]
         by_class: dict[int, list[tuple[str, LabeledExample]]] = {0: [], 1: []}
         for item in examples:
-            fingerprint = item.group or "|".join(f"{v:.6f}" for v in item.features.asdict().values())
+            fingerprint = item.group or "|".join(f"{value:.6f}" for value in item.features.asdict().values())
             digest = hashlib.sha256(f"{item.label}|{fingerprint}".encode()).hexdigest()
             by_class.setdefault(item.label, []).append((digest, item))
         for label in sorted(by_class):
@@ -119,21 +131,23 @@ class EvolutionEngine:
         params = {"__bias__": current.bias, **dict(current.weights), **dict(current.interactions)}
         anchors = dict(params)
         regularization = 1.0 / math.sqrt(len(examples))
+        temperature = max(1e-6, current.temperature)
+        sample_count = len(examples)
         for _ in range(50):
             gradients = {name: 0.0 for name in names}
-            curvature = {name: regularization for name in names}
+            curvature = {name: regularization * sample_count for name in names}
             for item in examples:
                 values = self._design(item.features, current)
-                linear = sum(params[name] * values[name] for name in names)
+                linear = sum(params[name] * values[name] for name in names) / temperature
                 probability = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, linear))))
                 error = probability - item.label
                 variance = probability * (1.0 - probability)
                 for name in names:
-                    value = values[name]
-                    gradients[name] += error * value
-                    curvature[name] += variance * value * value
+                    scaled_value = values[name] / temperature
+                    gradients[name] += error * scaled_value
+                    curvature[name] += variance * scaled_value * scaled_value
             max_change = 0.0
-            scale = 1.0 / len(examples)
+            scale = 1.0 / sample_count
             for name in names:
                 gradient = gradients[name] * scale + regularization * (params[name] - anchors[name])
                 hessian = curvature[name] * scale
@@ -154,7 +168,9 @@ class EvolutionEngine:
         )
         return self._select_operating_point(candidate, examples)
 
-    def _select_operating_point(self, candidate: Calibration, examples: list[LabeledExample]) -> Calibration:
+    def _select_operating_point(
+        self, candidate: Calibration, examples: list[LabeledExample]
+    ) -> Calibration:
         probabilities = [self._predict(candidate, item.features) for item in examples]
         ordered = sorted(set(probabilities))
         thresholds = [candidate.decision_threshold]
@@ -165,20 +181,26 @@ class EvolutionEngine:
         best_threshold = candidate.decision_threshold
         best_score = -1.0
         for threshold in thresholds:
-            preds = [int(probability >= threshold) for probability in probabilities]
-            score = math.sqrt(self._recall(preds, labels, 0) * self._recall(preds, labels, 1))
+            predictions = [int(probability >= threshold) for probability in probabilities]
+            score = math.sqrt(
+                self._recall(predictions, labels, 0) * self._recall(predictions, labels, 1)
+            )
             if score > best_score:
                 best_score = score
                 best_threshold = threshold
         distances = sorted(set(abs(probability - best_threshold) for probability in probabilities))
-        preds = [int(probability >= best_threshold) for probability in probabilities]
+        predictions = [int(probability >= best_threshold) for probability in probabilities]
         best_margin = 0.0
         best_selective = -1.0
         for margin in [0.0, *distances]:
-            kept = [i for i, probability in enumerate(probabilities) if abs(probability - best_threshold) >= margin]
+            kept = [
+                index
+                for index, probability in enumerate(probabilities)
+                if abs(probability - best_threshold) >= margin
+            ]
             if not kept:
                 continue
-            accuracy = sum(preds[i] == labels[i] for i in kept) / len(kept)
+            accuracy = sum(predictions[index] == labels[index] for index in kept) / len(kept)
             coverage = len(kept) / len(labels)
             score = accuracy * math.sqrt(coverage)
             if score > best_selective:
@@ -200,22 +222,47 @@ class EvolutionEngine:
             return 0.0
         probabilities = [self._predict(calibration, item.features) for item in examples]
         labels = [item.label for item in examples]
-        predictions = [int(probability >= calibration.decision_threshold) for probability in probabilities]
-        balanced = math.sqrt(self._recall(predictions, labels, 0) * self._recall(predictions, labels, 1))
-        brier = statistics.fmean((probability - label) ** 2 for probability, label in zip(probabilities, labels))
+        predictions = [
+            int(probability >= calibration.decision_threshold) for probability in probabilities
+        ]
+        balanced = math.sqrt(
+            self._recall(predictions, labels, 0) * self._recall(predictions, labels, 1)
+        )
+        brier = statistics.fmean(
+            (probability - label) ** 2 for probability, label in zip(probabilities, labels)
+        )
         ece = self._ece(probabilities, labels)
-        kept = [i for i, probability in enumerate(probabilities) if abs(probability - calibration.decision_threshold) >= calibration.abstain_margin]
+        kept = [
+            index
+            for index, probability in enumerate(probabilities)
+            if abs(probability - calibration.decision_threshold) >= calibration.abstain_margin
+        ]
         if not kept:
             return 0.0
-        selective_accuracy = sum(predictions[i] == labels[i] for i in kept) / len(kept)
+        selective_accuracy = sum(predictions[index] == labels[index] for index in kept) / len(kept)
         coverage = len(kept) / len(labels)
-        return balanced * (1.0 - brier) * (1.0 - ece) * math.sqrt(selective_accuracy * coverage)
+        return (
+            balanced
+            * (1.0 - brier)
+            * (1.0 - ece)
+            * math.sqrt(selective_accuracy * coverage)
+        )
 
-    def _no_class_regression(self, old: Calibration, new: Calibration, examples: list[LabeledExample]) -> bool:
+    def _no_class_regression(
+        self, old: Calibration, new: Calibration, examples: list[LabeledExample]
+    ) -> bool:
         labels = [item.label for item in examples]
-        old_predictions = [int(self._predict(old, item.features) >= old.decision_threshold) for item in examples]
-        new_predictions = [int(self._predict(new, item.features) >= new.decision_threshold) for item in examples]
-        return all(self._recall(new_predictions, labels, klass) >= self._recall(old_predictions, labels, klass) for klass in (0, 1))
+        old_predictions = [
+            int(self._predict(old, item.features) >= old.decision_threshold) for item in examples
+        ]
+        new_predictions = [
+            int(self._predict(new, item.features) >= new.decision_threshold) for item in examples
+        ]
+        return all(
+            self._recall(new_predictions, labels, klass)
+            >= self._recall(old_predictions, labels, klass)
+            for klass in (0, 1)
+        )
 
     @staticmethod
     def _aggregate(candidates: list[Calibration], fallback: Calibration) -> Calibration:
@@ -224,8 +271,14 @@ class EvolutionEngine:
         median = statistics.median
         return Calibration(
             bias=median([candidate.bias for candidate in candidates]),
-            weights={key: median([candidate.weights[key] for candidate in candidates]) for key in fallback.weights},
-            interactions={key: median([candidate.interactions[key] for candidate in candidates]) for key in fallback.interactions},
+            weights={
+                key: median([candidate.weights[key] for candidate in candidates])
+                for key in fallback.weights
+            },
+            interactions={
+                key: median([candidate.interactions[key] for candidate in candidates])
+                for key in fallback.interactions
+            },
             temperature=median([candidate.temperature for candidate in candidates]),
             semantic_weight=fallback.semantic_weight,
             decision_threshold=median([candidate.decision_threshold for candidate in candidates]),
@@ -238,7 +291,10 @@ class EvolutionEngine:
         return {
             "__bias__": 1.0,
             **{key: float(getattr(features, key, 0.0)) for key in calibration.weights},
-            **{key: interaction_value(features, key) for key in calibration.interactions},
+            **{
+                key: interaction_value(features, key)
+                for key in calibration.interactions
+            },
         }
 
     @staticmethod
@@ -254,15 +310,28 @@ class EvolutionEngine:
         error = 0.0
         for index in range(bins):
             low, high = index / bins, (index + 1) / bins
-            rows = [(probability, label) for probability, label in zip(probabilities, labels) if low <= probability < high or (index == bins - 1 and probability == 1.0)]
+            rows = [
+                (probability, label)
+                for probability, label in zip(probabilities, labels)
+                if low <= probability < high or (index == bins - 1 and probability == 1.0)
+            ]
             if rows:
-                error += len(rows) / len(probabilities) * abs(statistics.fmean(probability for probability, _ in rows) - statistics.fmean(label for _, label in rows))
+                error += len(rows) / len(probabilities) * abs(
+                    statistics.fmean(probability for probability, _ in rows)
+                    - statistics.fmean(label for _, label in rows)
+                )
         return error
 
     @staticmethod
     def _predict(calibration: Calibration, features: FeatureVector) -> float:
         linear = calibration.bias
-        linear += sum(calibration.weights[key] * getattr(features, key, 0.0) for key in calibration.weights)
-        linear += sum(calibration.interactions[key] * interaction_value(features, key) for key in calibration.interactions)
+        linear += sum(
+            calibration.weights[key] * getattr(features, key, 0.0)
+            for key in calibration.weights
+        )
+        linear += sum(
+            calibration.interactions[key] * interaction_value(features, key)
+            for key in calibration.interactions
+        )
         linear /= max(1e-6, calibration.temperature)
         return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, linear))))
