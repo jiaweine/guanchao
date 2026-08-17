@@ -37,7 +37,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
         case_id = _case_id_from_path(path)
         is_target_refresh = bool(case_id and method == 'PATCH' and path.endswith('/target'))
         is_asset_upload = bool(case_id and method == 'POST' and path.endswith('/assets'))
-        needs_guard = is_target_refresh or is_asset_upload
+        is_asset_delete = bool(case_id and method == 'DELETE' and '/assets/' in path)
+        is_asset_mutation = is_asset_upload or is_asset_delete
+        needs_guard = is_target_refresh or is_asset_mutation
 
         member = _request_member(app, request) if needs_guard else None
         can_manage = bool(member and member.get('role') in {'admin', 'analyst'})
@@ -50,12 +52,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if case and case.get('status') == 'archived':
                 return JSONResponse(
                     status_code=409,
-                    content={'detail': '已归档调查不能修改资料或添加素材，请先恢复'},
+                    content={'detail': '已归档调查不能修改资料或素材，请先恢复'},
                 )
-            if case and is_asset_upload and app.state.store.active_run_for_case(case_id):
+            if case and is_asset_mutation and app.state.store.active_run_for_case(case_id):
                 return JSONResponse(
                     status_code=409,
-                    content={'detail': '当前核查仍在进行，请完成后再添加素材，避免新素材未进入本轮证据快照'},
+                    content={'detail': '当前核查仍在进行，请完成后再修改素材，避免本轮证据快照发生歧义'},
                 )
 
         response = await call_next(request)
