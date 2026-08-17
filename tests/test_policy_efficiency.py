@@ -46,4 +46,4 @@ def test_harness_experience_replay_reduces_redundant_decisions(tmp_path):
 
     cold = fmean(counts[:3])
     learned = fmean(counts[-3:])
-    assert learned < cold, counts
+    assert learned <= cold * .8, counts
