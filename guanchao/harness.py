@@ -8,6 +8,7 @@ from typing import Any
 from .detection import MarketingDetector
 from .domain import RunEvent
 from .policy import OwnedPolicy
+from .semantic import SemanticEvidenceGateway
 from .store import Store
 from .tools import ToolRegistry
 from .verifier import ResultVerifier
@@ -25,6 +26,7 @@ class AgentHarness:
     def __init__(self, store: Store):
         self.store = store
         self.verifier = ResultVerifier()
+        self.semantic_gateway = SemanticEvidenceGateway()
         self._guard = threading.RLock()
         self._futures: dict[str, Future] = {}
         self._active_cases: dict[str, str] = {}
@@ -147,7 +149,7 @@ class AgentHarness:
         run = self.store.get_run(run_id)
         state = run["state"]
         case_id = run["case_id"]
-        detector = MarketingDetector(self.store.get_calibration())
+        detector = MarketingDetector(self.store.get_calibration(), self.semantic_gateway)
         policy = OwnedPolicy(self.store.get_policy_profile())
         registry = ToolRegistry(detector)
         try:

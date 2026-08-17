@@ -28,7 +28,7 @@ class PerceptionGateway:
 
     def __init__(self) -> None:
         self.vision_endpoint = os.getenv("GUANCHAO_VISION_ENDPOINT", "").rstrip("/")
-        self.vision_model = os.getenv("GUANCHAO_VISION_MODEL", "Qwen/Qwen3.5-27B")
+        self.vision_model = os.getenv("GUANCHAO_VISION_MODEL", "Qwen/Qwen3.6-35B-A3B")
         self.asr_endpoint = os.getenv("GUANCHAO_ASR_ENDPOINT", "").rstrip("/")
         self.timeout = float(os.getenv("GUANCHAO_MODEL_TIMEOUT", "45"))
 
