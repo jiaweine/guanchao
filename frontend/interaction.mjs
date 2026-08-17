@@ -1,5 +1,7 @@
 import { isCaseDetailRequest, requestMeta } from './runtime.mjs';
 
+const KIND_NAMES = { image: '图片', video: '视频', audio: '音频', document: '文档', other: '素材' };
+
 export function assetDeletePath(caseId, assetId) {
   return `/api/cases/${encodeURIComponent(caseId)}/assets/${encodeURIComponent(assetId)}`;
 }
@@ -12,6 +14,11 @@ export function canOfferAssetDelete(caseSnapshot, controlsWritable) {
     && latest?.status !== 'running'
     && controlsWritable
   );
+}
+
+export function removeAssetFromSnapshot(snapshot, assetId) {
+  snapshot.assets = (snapshot.assets || []).filter((item) => item.id !== assetId);
+  return snapshot.assets;
 }
 
 function notify(documentRef, message) {
@@ -112,6 +119,22 @@ function installModalInertState(windowRef, documentRef) {
   });
 }
 
+function syncAssetTray(documentRef, assets) {
+  const tray = documentRef.querySelector?.('#uploadTray');
+  if (!tray) return;
+  tray.replaceChildren();
+  tray.hidden = !assets.length;
+  assets.slice(-6).forEach((asset) => {
+    const chip = documentRef.createElement('span');
+    chip.className = 'upload-chip';
+    chip.dataset.assetId = asset.id;
+    const kind = documentRef.createElement('b');
+    kind.textContent = KIND_NAMES[asset.kind] || '素材';
+    chip.append(kind, documentRef.createTextNode(asset.name || '素材'));
+    tray.appendChild(chip);
+  });
+}
+
 function decorateAssetDeleteActions(windowRef, documentRef, snapshot) {
   const attach = documentRef.querySelector?.('#attachBtn');
   const canDelete = canOfferAssetDelete(snapshot, Boolean(attach && !attach.disabled));
@@ -138,19 +161,12 @@ function decorateAssetDeleteActions(windowRef, documentRef, snapshot) {
           const payload = await response.clone().json().catch(() => ({}));
           throw new Error(payload.detail || '素材移除失败');
         }
-        const visibleBefore = assets.slice(-6);
-        const trayIndex = visibleBefore.findIndex((item) => item.id === asset.id);
         row.remove();
-        if (trayIndex >= 0) {
-          const chips = [...documentRef.querySelectorAll?.('#uploadTray .upload-chip') || []];
-          chips[trayIndex]?.remove();
-        }
-        snapshot.assets = assets.filter((item) => item.id !== asset.id);
-        if (!snapshot.assets.length) {
+        const remaining = removeAssetFromSnapshot(snapshot, asset.id);
+        syncAssetTray(documentRef, remaining);
+        if (!remaining.length) {
           const list = documentRef.querySelector?.('#assetList');
           if (list) list.innerHTML = '<div class="side-empty">还没有添加素材。</div>';
-          const tray = documentRef.querySelector?.('#uploadTray');
-          if (tray) tray.hidden = true;
         }
         notify(documentRef, '素材已移除');
       } catch (error) {

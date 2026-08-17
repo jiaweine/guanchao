@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import weakref
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -27,55 +29,78 @@ def _request_member(app: FastAPI, request: Request) -> dict[str, Any] | None:
         return None
 
 
+def _serialize_case_mutation(path: str, method: str, case_id: str | None) -> bool:
+    if not case_id or method in {'GET', 'HEAD', 'OPTIONS'}:
+        return False
+    if path.endswith('/comments'):
+        return False
+    return True
+
+
 def create_app(db_path: str | None = None) -> FastAPI:
     app = create_core_app(db_path)
+    case_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+    def lock_for(case_id: str) -> asyncio.Lock:
+        lock = case_locks.get(case_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            case_locks[case_id] = lock
+        return lock
 
     @app.middleware('http')
     async def enforce_product_state_consistency(request: Request, call_next: Any):
         path = request.url.path
         method = request.method.upper()
         case_id = _case_id_from_path(path)
-        is_target_refresh = bool(case_id and method == 'PATCH' and path.endswith('/target'))
-        is_asset_upload = bool(case_id and method == 'POST' and path.endswith('/assets'))
-        is_asset_delete = bool(case_id and method == 'DELETE' and '/assets/' in path)
-        is_asset_mutation = is_asset_upload or is_asset_delete
-        needs_guard = is_target_refresh or is_asset_mutation
 
-        member = _request_member(app, request) if needs_guard else None
-        can_manage = bool(member and member.get('role') in {'admin', 'analyst'})
+        async def dispatch():
+            is_target_refresh = bool(case_id and method == 'PATCH' and path.endswith('/target'))
+            is_asset_upload = bool(case_id and method == 'POST' and path.endswith('/assets'))
+            is_asset_delete = bool(case_id and method == 'DELETE' and '/assets/' in path)
+            is_asset_mutation = is_asset_upload or is_asset_delete
+            needs_guard = is_target_refresh or is_asset_mutation
 
-        if can_manage and case_id:
-            try:
-                case = app.state.store.get_case(case_id)
-            except KeyError:
-                case = None
-            if case and case.get('status') == 'archived':
+            member = _request_member(app, request) if needs_guard else None
+            can_manage = bool(member and member.get('role') in {'admin', 'analyst'})
+
+            if can_manage and case_id:
+                try:
+                    case = app.state.store.get_case(case_id)
+                except KeyError:
+                    case = None
+                if case and case.get('status') == 'archived':
+                    return JSONResponse(
+                        status_code=409,
+                        content={'detail': '已归档调查不能修改资料或素材，请先恢复'},
+                    )
+                if case and is_asset_mutation and app.state.store.active_run_for_case(case_id):
+                    return JSONResponse(
+                        status_code=409,
+                        content={'detail': '当前核查仍在进行，请完成后再修改素材，避免本轮证据快照发生歧义'},
+                    )
+
+            response = await call_next(request)
+
+            if can_manage and case_id and is_target_refresh and response.status_code == 429:
+                try:
+                    case = app.state.store.get_case(case_id)
+                except KeyError:
+                    return response
                 return JSONResponse(
-                    status_code=409,
-                    content={'detail': '已归档调查不能修改资料或素材，请先恢复'},
+                    status_code=202,
+                    content={
+                        'case': case,
+                        'run_id': None,
+                        'capacity_limited': True,
+                    },
+                    headers={'X-Guanchao-Run-Deferred': '1'},
                 )
-            if case and is_asset_mutation and app.state.store.active_run_for_case(case_id):
-                return JSONResponse(
-                    status_code=409,
-                    content={'detail': '当前核查仍在进行，请完成后再修改素材，避免本轮证据快照发生歧义'},
-                )
+            return response
 
-        response = await call_next(request)
-
-        if can_manage and case_id and is_target_refresh and response.status_code == 429:
-            try:
-                case = app.state.store.get_case(case_id)
-            except KeyError:
-                return response
-            return JSONResponse(
-                status_code=202,
-                content={
-                    'case': case,
-                    'run_id': None,
-                    'capacity_limited': True,
-                },
-                headers={'X-Guanchao-Run-Deferred': '1'},
-            )
-        return response
+        if _serialize_case_mutation(path, method, case_id):
+            async with lock_for(case_id):
+                return await dispatch()
+        return await dispatch()
 
     return app

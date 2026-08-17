@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 from fastapi.testclient import TestClient
 
@@ -131,3 +133,46 @@ def test_read_hot_path_does_not_invoke_extra_wrapper_member_lookup(tmp_path, mon
     monkeypatch.setattr(api_module, '_request_member', forbidden_lookup)
     response = client.get('/api/status')
     assert response.status_code == 200
+
+
+def test_case_mutation_lock_prevents_asset_and_run_start_from_crossing_snapshots(tmp_path, monkeypatch):
+    asset_dir = tmp_path / 'assets'
+    monkeypatch.setenv('GUANCHAO_ASSET_DIR', str(asset_dir))
+    app = create_app(str(tmp_path / 'db.sqlite'))
+    client = TestClient(app)
+    case = _case(client)
+
+    run_entered = Event()
+    release_run = Event()
+    asset_entered = Event()
+    original_create_asset = app.state.store.create_asset
+
+    def slow_start(*args, **kwargs):
+        run_entered.set()
+        assert release_run.wait(2), 'test did not release run start'
+        return 'serialized-run'
+
+    def observed_create_asset(*args, **kwargs):
+        asset_entered.set()
+        return original_create_asset(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.harness, 'start', slow_start)
+    monkeypatch.setattr(app.state.store, 'create_asset', observed_create_asset)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        run_future = executor.submit(
+            client.post,
+            f"/api/cases/{case['id']}/messages",
+            json={'content': '开始核查'},
+        )
+        assert run_entered.wait(1), 'run request did not enter harness'
+        asset_future = executor.submit(
+            client.post,
+            f"/api/cases/{case['id']}/assets",
+            files={'file': ('serialized.txt', b'evidence', 'text/plain')},
+        )
+        assert not asset_entered.wait(0.12), 'asset mutation crossed an in-flight run start'
+        release_run.set()
+        assert run_future.result(timeout=2).status_code == 200
+        assert asset_future.result(timeout=2).status_code == 200
+        assert asset_entered.is_set()

@@ -8,7 +8,7 @@ import {
   isSensitiveCaseWrite,
   requestMeta,
 } from '../frontend/runtime.mjs';
-import { assetDeletePath, canOfferAssetDelete } from '../frontend/interaction.mjs';
+import { assetDeletePath, canOfferAssetDelete, removeAssetFromSnapshot } from '../frontend/interaction.mjs';
 
 const response = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 
@@ -90,11 +90,15 @@ test('failed message request restores the draft instead of losing user text', as
   assert.equal(input.value, '不要丢掉这段文字');
 });
 
-test('asset management only offers deletion for writable idle cases', () => {
+test('asset management only offers deletion for writable idle cases and survives consecutive deletes', () => {
   const base = { id: 'case a', status: 'active', runs: [{ status: 'completed' }] };
   assert.equal(canOfferAssetDelete(base, true), true);
   assert.equal(canOfferAssetDelete({ ...base, status: 'archived' }, true), false);
   assert.equal(canOfferAssetDelete({ ...base, runs: [{ status: 'running' }] }, true), false);
   assert.equal(canOfferAssetDelete(base, false), false);
   assert.equal(assetDeletePath('case a', 'asset/1'), '/api/cases/case%20a/assets/asset%2F1');
+
+  const snapshot = { assets: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] };
+  assert.deepEqual(removeAssetFromSnapshot(snapshot, 'a').map((item) => item.id), ['b', 'c']);
+  assert.deepEqual(removeAssetFromSnapshot(snapshot, 'b').map((item) => item.id), ['c']);
 });
