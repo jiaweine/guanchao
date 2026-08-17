@@ -1,0 +1,70 @@
+name: Render README HD images
+
+on:
+  push:
+    branches:
+      - agent/readme-hd-math-fix
+    paths:
+      - README.md
+      - tests/test_release_contract.py
+      - docs/product-preview.svg
+      - docs/product-batch.svg
+      - docs/product-review-queue.svg
+      - docs/product-evidence.svg
+      - .github/workflows/render-readme-hd.yml
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install renderer and CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+          python -m pip install --quiet cairosvg
+      - name: Render product previews at retina resolution
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import struct
+          import cairosvg
+
+          names = [
+              'product-preview',
+              'product-batch',
+              'product-review-queue',
+              'product-evidence',
+          ]
+          for name in names:
+              source = Path('docs') / f'{name}.svg'
+              target = Path('docs') / f'{name}.png'
+              cairosvg.svg2png(
+                  url=str(source),
+                  write_to=str(target),
+                  output_width=2400,
+                  output_height=1440,
+              )
+              data = target.read_bytes()
+              assert data.startswith(b'\x89PNG\r\n\x1a\n')
+              width, height = struct.unpack('>II', data[16:24])
+              assert (width, height) == (2400, 1440)
+              print(f'{target}: {width}x{height}')
+          PY
+      - name: Commit rendered PNGs
+        run: |
+          git add docs/product-preview.png docs/product-batch.png docs/product-review-queue.png docs/product-evidence.png
+          if git diff --cached --quiet; then
+            echo 'Rendered images already match.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'render HD README product images'
+          git push origin HEAD:${GITHUB_REF_NAME}
