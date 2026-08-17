@@ -15,11 +15,13 @@ const response = (data, status = 200) => new Response(JSON.stringify(data), { st
 test('request classification keeps case-scoped writes explicit', () => {
   const detail = requestMeta('/api/cases/a', {}, 'http://local/?case=a');
   const review = requestMeta('/api/reviews', { method: 'POST', body: JSON.stringify({ case_id: 'a' }) }, 'http://local/?case=a');
+  const comment = requestMeta('/api/cases/a/comments', { method: 'POST', body: JSON.stringify({ content: 'note' }) }, 'http://local/?case=a');
   assert.equal(currentCaseIdFromHref('http://local/?case=a'), 'a');
   assert.equal(caseIdFromRequest(detail), 'a');
   assert.equal(isCaseDetailRequest(detail), true);
   assert.equal(caseIdFromRequest(review), 'a');
   assert.equal(isSensitiveCaseWrite(review), true);
+  assert.equal(isSensitiveCaseWrite(comment), true);
 });
 
 test('older case detail response is replaced by the latest requested case', async () => {
@@ -61,6 +63,19 @@ test('selected case state closes the gap before the browser URL is updated', asy
   const staleWrite = await write;
   assert.equal(staleWrite.status, 409);
   assert.match((await staleWrite.json()).detail, /原调查/);
+});
+
+test('stale collaborative note response cannot clear the newly opened case composer', async () => {
+  let href = 'http://local/?case=a';
+  let resolveComment;
+  const nativeFetch = () => new Promise((resolve) => { resolveComment = resolve; });
+  const guarded = createGuardedFetch({ nativeFetch, getHref: () => href });
+  const comment = guarded('/api/cases/a/comments', { method: 'POST', body: JSON.stringify({ content: 'A 的备注' }) });
+  href = 'http://local/?case=b';
+  resolveComment(response({ ok: true }));
+  const guardedResponse = await comment;
+  assert.equal(guardedResponse.status, 409);
+  assert.match((await guardedResponse.json()).detail, /原调查/);
 });
 
 test('failed message request restores the draft instead of losing user text', async () => {

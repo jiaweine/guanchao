@@ -58,9 +58,7 @@ export function isSensitiveCaseWrite(meta) {
   if (meta.url.pathname === '/api/reviews' && meta.method === 'POST') return true;
   const caseId = caseIdFromRequest(meta);
   if (!caseId || ['GET', 'HEAD', 'OPTIONS'].includes(meta.method)) return false;
-  if (meta.url.pathname.endsWith('/comments')) return false;
-  if (meta.url.pathname === '/api/events') return false;
-  return true;
+  return meta.url.pathname !== '/api/events';
 }
 
 function jsonResponse(data, status = 200) {
@@ -218,8 +216,8 @@ export function installRuntimeGuards({ windowRef = window, documentRef = documen
     if (attach) attach.disabled = true;
   };
 
-  const updateRunState = (caseId, running) => {
-    if (caseId) selection.select(caseId);
+  const observeRunState = (caseId, running) => {
+    if (!caseId) return;
     runningCases.set(caseId, Boolean(running));
     if (!running) return;
     enforceRunningControls(caseId);
@@ -227,12 +225,17 @@ export function installRuntimeGuards({ windowRef = window, documentRef = documen
     setTimeout(() => enforceRunningControls(caseId), 0);
   };
 
+  const selectCaseState = (caseId, running) => {
+    if (caseId) selection.select(caseId);
+    observeRunState(caseId, running);
+  };
+
   windowRef.fetch = createGuardedFetch({
     nativeFetch,
     getHref: () => windowRef.location.href,
     documentRef,
-    onCaseState: updateRunState,
-    onRunState: updateRunState,
+    onCaseState: selectCaseState,
+    onRunState: observeRunState,
     onReviewBusy: (busy) => { reviewBusy = busy; },
   });
 

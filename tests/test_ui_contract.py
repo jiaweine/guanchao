@@ -49,6 +49,8 @@ def test_switching_cases_discards_stale_polling_and_case_detail_results():
     assert 'coordinateRead' in runtime
     assert '__stale_case_request__' in runtime
     assert 'caseSelection' in runtime
+    assert 'onCaseState: selectCaseState' in runtime
+    assert 'onRunState: observeRunState' in runtime
 
 
 def test_review_queue_supports_continuous_keyboard_review_without_double_submit():
@@ -81,9 +83,11 @@ def test_browser_cannot_choose_or_forge_workspace_identity():
 def test_customer_workspace_has_collaborative_notes_separate_from_agent_chat():
     html = Path('frontend/index.html').read_text(encoding='utf-8')
     js = Path('frontend/app-core.js').read_text(encoding='utf-8')
+    runtime = Path('frontend/runtime.mjs').read_text(encoding='utf-8')
     assert '协作备注' in html
     assert '/comments' in js
     assert 'caseNoteInput' in js
+    assert "meta.url.pathname.endsWith('/comments')" not in runtime
 
 
 def test_runtime_protects_drafts_stale_writes_and_modal_keyboard_access():
