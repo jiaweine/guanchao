@@ -1,0 +1,59 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  caseIdFromRequest,
+  createGuardedFetch,
+  currentCaseIdFromHref,
+  isCaseDetailRequest,
+  isSensitiveCaseWrite,
+  requestMeta,
+} from '../frontend/runtime.mjs';
+
+const response = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+
+test('request classification keeps case-scoped writes explicit', () => {
+  const detail = requestMeta('/api/cases/a', {}, 'http://local/?case=a');
+  const review = requestMeta('/api/reviews', { method: 'POST', body: JSON.stringify({ case_id: 'a' }) }, 'http://local/?case=a');
+  assert.equal(currentCaseIdFromHref('http://local/?case=a'), 'a');
+  assert.equal(caseIdFromRequest(detail), 'a');
+  assert.equal(isCaseDetailRequest(detail), true);
+  assert.equal(caseIdFromRequest(review), 'a');
+  assert.equal(isSensitiveCaseWrite(review), true);
+});
+
+test('older case detail response is replaced by the latest requested case', async () => {
+  const pending = new Map();
+  const nativeFetch = (input) => new Promise((resolve) => pending.set(String(input), resolve));
+  const guarded = createGuardedFetch({ nativeFetch, getHref: () => 'http://local/?case=a' });
+  const first = guarded('/api/cases/a');
+  const second = guarded('/api/cases/b');
+  pending.get('/api/cases/b')(response({ id: 'b' }));
+  pending.get('/api/cases/a')(response({ id: 'a' }));
+  assert.equal((await (await second).json()).id, 'b');
+  assert.equal((await (await first).json()).id, 'b');
+});
+
+test('successful stale write cannot mutate the newly opened case UI', async () => {
+  let href = 'http://local/?case=a';
+  let resolveWrite;
+  const nativeFetch = () => new Promise((resolve) => { resolveWrite = resolve; });
+  const guarded = createGuardedFetch({ nativeFetch, getHref: () => href });
+  const write = guarded('/api/cases/a', { method: 'PATCH', body: JSON.stringify({ priority: 'high' }) });
+  href = 'http://local/?case=b';
+  resolveWrite(response({ id: 'a' }));
+  const guardedResponse = await write;
+  assert.equal(guardedResponse.status, 409);
+  assert.match((await guardedResponse.json()).detail, /原调查/);
+});
+
+test('failed message request restores the draft instead of losing user text', async () => {
+  const input = { value: '', dispatchEvent() {} };
+  const documentRef = { querySelector(selector) { return selector === '#messageInput' ? input : null; } };
+  const guarded = createGuardedFetch({
+    nativeFetch: async () => response({ detail: 'busy' }, 409),
+    getHref: () => 'http://local/?case=a',
+    documentRef,
+  });
+  await guarded('/api/cases/a/messages', { method: 'POST', body: JSON.stringify({ content: '不要丢掉这段文字' }) });
+  assert.equal(input.value, '不要丢掉这段文字');
+});
