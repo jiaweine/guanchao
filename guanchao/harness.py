@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from typing import Any
 
 from .detection import MarketingDetector
 from .domain import RunEvent
+from .evolution import EvolutionEngine
 from .policy import OwnedPolicy
 from .semantic import SemanticEvidenceGateway
 from .store import Store
@@ -28,15 +30,15 @@ class AgentHarness:
         self.verifier = ResultVerifier()
         self.semantic_gateway = SemanticEvidenceGateway()
         self._guard = threading.RLock()
+        self._learning_guard = threading.RLock()
         self._futures: dict[str, Future] = {}
         self._active_cases: dict[str, str] = {}
         max_workers = max(2, int(os.getenv("GUANCHAO_MAX_WORKERS", "8")))
         self._max_inflight = max(max_workers, int(os.getenv("GUANCHAO_MAX_INFLIGHT", "256")))
         self._capacity = threading.BoundedSemaphore(self._max_inflight)
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="guanchao",
-        )
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="guanchao")
+        self._learning_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guanchao-learning")
+        self._learning_future: Future | None = None
 
     def start(self, case_id: str, message: str, actor: str = "local") -> str:
         self._reserve(1)
@@ -66,12 +68,7 @@ class AgentHarness:
                     run = self.store.get_run(run_id)
                     state = run["state"]
                     state["events"].append(
-                        RunEvent.create(
-                            "error",
-                            "批量核查未启动",
-                            "批量任务准备过程中断，可以重新发起。",
-                            status="error",
-                        ).asdict()
+                        RunEvent.create("error", "批量核查未启动", "批量任务准备过程中断，可以重新发起。", status="error").asdict()
                     )
                     self.store.update_run(run_id, state, "failed")
                     self._active_cases.pop(case_id, None)
@@ -100,7 +97,6 @@ class AgentHarness:
         db_active = self.store.active_run_for_case(case_id)
         if db_active:
             raise ActiveRunError(db_active["id"])
-
         self.store.add_message(case_id, "user", message)
         assets = self.store.list_assets(case_id, include_text=True)
         state: dict[str, Any] = {
@@ -109,19 +105,13 @@ class AgentHarness:
             "assets": assets,
             "sample_size": len(case["targets"][0].get("posts") or []) if case["targets"] else 0,
             "completed_tools": [],
-            "events": [
-                RunEvent.create(
-                    "plan",
-                    "开始核查",
-                    "正在判断哪些证据最值得先看。",
-                    status="working",
-                ).asdict()
-            ],
+            "events": [RunEvent.create("plan", "开始核查", "正在判断哪些证据最值得先看。", status="working").asdict()],
             "evidence": [],
             "tool_outputs": {},
             "primary_result": {},
             "answer": None,
             "decision_count": 0,
+            "trajectory": [],
         }
         run = self.store.create_run(case_id, state, actor=actor)
         self._active_cases[case_id] = run["id"]
@@ -145,6 +135,23 @@ class AgentHarness:
         except TimeoutError:
             return
 
+    def wait_learning(self, timeout: float = 10) -> None:
+        with self._learning_guard:
+            future = self._learning_future
+        if future is None:
+            return
+        try:
+            future.result(timeout=timeout)
+        except TimeoutError:
+            return
+
+    def observe_review(self, run_id: str, decision: str, actor: str = "local") -> None:
+        with self._learning_guard:
+            previous = self._learning_future
+            self._learning_future = self._learning_executor.submit(
+                self._apply_review_learning, run_id, decision, actor, previous
+            )
+
     def _execute(self, run_id: str) -> None:
         run = self.store.get_run(run_id)
         state = run["state"]
@@ -153,23 +160,22 @@ class AgentHarness:
         policy = OwnedPolicy(self.store.get_policy_profile())
         registry = ToolRegistry(detector)
         try:
-            for _ in range(12):
+            for _ in range(len(registry.names()) + 1):
                 decision = policy.decide(state["goal"], state)
                 if decision is None:
                     break
                 state["decision_count"] += 1
                 state["events"].append(
-                    RunEvent.create(
-                        "decision", "继续核查", decision.reason, decision.tool, "working"
-                    ).asdict()
+                    RunEvent.create("decision", "继续核查", decision.reason, decision.tool, "working").asdict()
                 )
+                before = policy.signal(state)
+                started = time.perf_counter()
                 result = registry.get(decision.tool).handler(state)
+                duration_ms = (time.perf_counter() - started) * 1000.0
                 ok, reason = self.verifier.verify(result)
                 if not ok:
                     state["events"].append(
-                        RunEvent.create(
-                            "verify", "这一步没有通过检查", reason, decision.tool, "error"
-                        ).asdict()
+                        RunEvent.create("verify", "这一步没有通过检查", reason, decision.tool, "error").asdict()
                     )
                     self.store.update_run(run_id, state, "failed")
                     return
@@ -177,47 +183,42 @@ class AgentHarness:
                 state["tool_outputs"][decision.tool] = result.asdict()
                 self._merge_evidence(state, result.asdict()["evidence"])
                 state["events"].append(
-                    RunEvent.create(
-                        "tool",
-                        self._customer_title(decision.tool),
-                        result.summary,
-                        decision.tool,
-                        "done",
-                    ).asdict()
+                    RunEvent.create("tool", self._customer_title(decision.tool), result.summary, decision.tool, "done").asdict()
                 )
                 if decision.tool == "content.scan":
                     state["primary_result"] = result.payload
                 if decision.tool == "stability.probe" and state.get("primary_result"):
-                    state["primary_result"]["stability"] = result.payload.get(
-                        "stability", state["primary_result"].get("stability")
-                    )
+                    state["primary_result"]["stability"] = result.payload.get("stability", state["primary_result"].get("stability"))
                 if decision.tool == "verdict.compose":
                     state["primary_result"] = result.payload
                     state["answer"] = result.payload["summary"]
                     self.store.add_message(case_id, "assistant", state["answer"])
+                if decision.features:
+                    after = policy.signal(state)
+                    state["trajectory"].append(
+                        {
+                            "action": decision.tool,
+                            "features": decision.features,
+                            "alternative": decision.alternative,
+                            "alternative_features": decision.alternative_features,
+                            "reward": policy.reward(before, after, decision.tool, duration_ms),
+                            "duration_ms": duration_ms,
+                        }
+                    )
                 self.store.update_run(run_id, state, "running")
-
             if not state.get("answer"):
                 state["answer"] = "当前资料还不足以形成稳定判断，请补充更多近期内容或可核对素材。"
                 self.store.add_message(case_id, "assistant", state["answer"])
             state["events"].append(
-                RunEvent.create(
-                    "complete",
-                    "核查完成",
-                    "判断、证据和待补资料已经整理好。",
-                    status="done",
-                ).asdict()
+                RunEvent.create("complete", "核查完成", "判断、证据和待补资料已经整理好。", status="done").asdict()
             )
             self.store.update_run(run_id, state, "completed")
+            if state.get("trajectory"):
+                self._schedule_trajectory_learning(run_id, state["trajectory"])
         except Exception as exc:
             state["internal_error"] = type(exc).__name__
             state["events"].append(
-                RunEvent.create(
-                    "error",
-                    "执行未完成",
-                    "本次核查中断，已保留已有记录，可以重新发起。",
-                    status="error",
-                ).asdict()
+                RunEvent.create("error", "执行未完成", "本次核查中断，已保留已有记录，可以重新发起。", status="error").asdict()
             )
             self.store.update_run(run_id, state, "failed")
         finally:
@@ -226,24 +227,69 @@ class AgentHarness:
                 self._active_cases.pop(case_id, None)
             self._capacity.release()
 
+    def _schedule_trajectory_learning(self, run_id: str, trajectory: list[dict[str, Any]]) -> None:
+        with self._learning_guard:
+            previous = self._learning_future
+            self._learning_future = self._learning_executor.submit(
+                self._apply_trajectory_learning, run_id, list(trajectory), previous
+            )
+
+    def _apply_trajectory_learning(self, run_id: str, trajectory: list[dict[str, Any]], previous: Future | None = None) -> None:
+        if previous is not None:
+            try:
+                previous.result()
+            except Exception:
+                pass
+        profile = self.store.get_policy_profile()
+        profile.observe(trajectory)
+        self.store.save_policy_profile(profile)
+        self.store.record_event(
+            "harness_experience_replayed",
+            run_id=run_id,
+            metadata={"steps": len(trajectory), "policy_steps": profile.steps},
+        )
+
+    def _apply_review_learning(self, run_id: str, decision: str, actor: str, previous: Future | None = None) -> None:
+        if previous is not None:
+            try:
+                previous.result()
+            except Exception:
+                pass
+        if decision == "uncertain":
+            return
+        run = self.store.get_run(run_id)
+        state = run.get("state") or {}
+        trajectory = list(state.get("trajectory") or [])
+        result = state.get("primary_result") or {}
+        calibration = self.store.get_calibration()
+        predicted = float(result.get("marketing_likelihood") or 0.0) >= calibration.decision_threshold
+        human = decision == "confirm_marketing"
+        profile = self.store.get_policy_profile()
+        profile.observe_review(trajectory, predicted == human)
+        self.store.save_policy_profile(profile)
+        report = EvolutionEngine().evolve(calibration, self.store.labeled_examples(), profile)
+        if report.accepted:
+            self.store.save_calibration(report.calibration)
+        self.store.record_event(
+            "harness_self_evolved",
+            actor=actor,
+            run_id=run_id,
+            metadata={
+                "review_correct": predicted == human,
+                "calibration_promoted": report.accepted,
+                "examples": report.examples,
+                "policy_steps": profile.steps,
+            },
+        )
+
     @staticmethod
     def _merge_evidence(state: dict[str, Any], items: list[dict[str, Any]]) -> None:
         seen = {
-            (
-                evidence.get("key"),
-                evidence.get("direction"),
-                tuple(evidence.get("post_ids") or []),
-                tuple(evidence.get("asset_ids") or []),
-            )
+            (evidence.get("key"), evidence.get("direction"), tuple(evidence.get("post_ids") or []), tuple(evidence.get("asset_ids") or []))
             for evidence in state.get("evidence") or []
         }
         for item in items:
-            key = (
-                item.get("key"),
-                item.get("direction"),
-                tuple(item.get("post_ids") or []),
-                tuple(item.get("asset_ids") or []),
-            )
+            key = (item.get("key"), item.get("direction"), tuple(item.get("post_ids") or []), tuple(item.get("asset_ids") or []))
             if key not in seen:
                 state["evidence"].append(item)
                 seen.add(key)
