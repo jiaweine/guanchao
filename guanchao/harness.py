@@ -44,12 +44,16 @@ class AgentHarness:
 
     def start(self, case_id: str, message: str, actor: str = "local") -> str:
         self._reserve(1)
+        run_id: str | None = None
         try:
             with self._guard:
                 run_id = self._prepare_run(case_id, message, actor)
                 self._submit(run_id)
                 return run_id
         except Exception:
+            if run_id is not None:
+                with self._guard:
+                    self._fail_unsubmitted_run(case_id, run_id, "核查未启动")
             self._capacity.release()
             raise
 
@@ -58,23 +62,22 @@ class AgentHarness:
             return []
         self._reserve(len(case_ids))
         prepared: list[tuple[str, str]] = []
+        submitted = 0
         try:
             with self._guard:
                 for case_id in case_ids:
                     prepared.append((case_id, self._prepare_run(case_id, message, actor)))
                 for _, run_id in prepared:
                     self._submit(run_id)
+                    submitted += 1
         except Exception:
             with self._guard:
-                for case_id, run_id in prepared:
-                    run = self.store.get_run(run_id)
-                    state = run["state"]
-                    state["events"].append(
-                        RunEvent.create("error", "批量核查未启动", "批量任务准备过程中断，可以重新发起。", status="error").asdict()
-                    )
-                    self.store.update_run(run_id, state, "failed")
-                    self._active_cases.pop(case_id, None)
-            for _ in case_ids:
+                for case_id, run_id in prepared[submitted:]:
+                    self._fail_unsubmitted_run(case_id, run_id, "批量核查未启动")
+            # Submitted workers own their reservations and release them in
+            # _execute(). Only release reservations for work that never reached
+            # the executor; otherwise BoundedSemaphore can be double-released.
+            for _ in range(len(case_ids) - submitted):
                 self._capacity.release()
             raise
         return [{"case_id": case_id, "run_id": run_id} for case_id, run_id in prepared]
@@ -122,6 +125,25 @@ class AgentHarness:
     def _submit(self, run_id: str) -> None:
         self._futures[run_id] = self._executor.submit(self._execute, run_id)
 
+    def _fail_unsubmitted_run(self, case_id: str, run_id: str, title: str) -> None:
+        try:
+            run = self.store.get_run(run_id)
+        except KeyError:
+            self._active_cases.pop(case_id, None)
+            return
+        if run["status"] == "running":
+            state = run["state"]
+            state.setdefault("events", []).append(
+                RunEvent.create(
+                    "error",
+                    title,
+                    "任务没有进入执行器，已安全结束本次记录，可以重新发起。",
+                    status="error",
+                ).asdict()
+            )
+            self.store.update_run(run_id, state, "failed")
+        self._active_cases.pop(case_id, None)
+
     def execute_inline(self, case_id: str, message: str, actor: str = "local") -> dict[str, Any]:
         run_id = self.start(case_id, message, actor=actor)
         self.wait(run_id, 10)
@@ -158,8 +180,12 @@ class AgentHarness:
         run = self.store.get_run(run_id)
         state = run["state"]
         case_id = run["case_id"]
-        detector = MarketingDetector(self.store.get_calibration(), self.semantic_gateway)
-        policy = OwnedPolicy(self.store.get_policy_profile())
+        calibration = self.store.get_calibration()
+        detector = MarketingDetector(calibration, self.semantic_gateway)
+        policy = OwnedPolicy(
+            self.store.get_policy_profile(),
+            decision_threshold=calibration.decision_threshold,
+        )
         registry = ToolRegistry(detector)
         try:
             for _ in range(len(registry.names()) + 1):
