@@ -287,6 +287,14 @@ class EvolutionEngine:
         if not candidates:
             return fallback
         median = statistics.median
+        decision_threshold = median([candidate.decision_threshold for candidate in candidates])
+        abstain_margin = median([candidate.abstain_margin for candidate in candidates])
+        maximum_band = max(0.0, min(decision_threshold, 1.0 - decision_threshold))
+        upper_abstain = min(1.0, decision_threshold + min(maximum_band, abstain_margin))
+        high_threshold = max(
+            upper_abstain,
+            median([candidate.high_threshold for candidate in candidates]),
+        )
         return Calibration(
             bias=median([candidate.bias for candidate in candidates]),
             weights={
@@ -299,9 +307,9 @@ class EvolutionEngine:
             },
             temperature=median([candidate.temperature for candidate in candidates]),
             semantic_weight=fallback.semantic_weight,
-            decision_threshold=median([candidate.decision_threshold for candidate in candidates]),
-            abstain_margin=median([candidate.abstain_margin for candidate in candidates]),
-            high_threshold=median([candidate.high_threshold for candidate in candidates]),
+            decision_threshold=decision_threshold,
+            abstain_margin=abstain_margin,
+            high_threshold=min(1.0, high_threshold),
         )
 
     @staticmethod
