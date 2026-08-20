@@ -79,7 +79,10 @@ class Calibration:
         semantic_weight = _clip_range(float(raw.get("semantic_weight", base.semantic_weight)), 0.0, 1.0)
         decision_threshold = _clip_range(float(raw.get("decision_threshold", base.decision_threshold)), 0.01, 0.99)
         abstain_margin = _clip_range(float(raw.get("abstain_margin", base.abstain_margin)), 0.0, 0.49)
-        high_threshold = _clip_range(float(raw.get("high_threshold", base.high_threshold)), decision_threshold, 1.0)
+        maximum_band = max(0.0, min(decision_threshold, 1.0 - decision_threshold))
+        effective_abstain = min(maximum_band, abstain_margin)
+        high_floor = min(1.0, decision_threshold + effective_abstain)
+        high_threshold = _clip_range(float(raw.get("high_threshold", base.high_threshold)), high_floor, 1.0)
         return cls(
             bias=bias,
             weights=weights,
