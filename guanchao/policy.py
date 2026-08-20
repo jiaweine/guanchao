@@ -243,8 +243,13 @@ class Decision:
 class OwnedPolicy:
     """Self-evolving contextual policy with experience replay."""
 
-    def __init__(self, profile: PolicyProfile | None = None):
+    def __init__(
+        self,
+        profile: PolicyProfile | None = None,
+        decision_threshold: float = 0.5,
+    ):
         self.profile = profile or PolicyProfile()
+        self.decision_threshold = _clip(decision_threshold, 0.01, 0.99)
 
     def decide(self, goal: str, state: dict[str, Any]) -> Decision | None:
         completed = set(state.get("completed_tools") or [])
@@ -278,7 +283,7 @@ class OwnedPolicy:
         evidence_count = len({(e.get("key"), e.get("direction")) for e in state.get("evidence") or []})
         ready_assets = sum(1 for item in assets if item.get("status") == "ready")
         uncertainty = 1.0 - confidence
-        boundary = 1.0 - min(1.0, abs(marketing - 0.5) * 2.0)
+        boundary = self._boundary(marketing)
         instability = 1.0 - stability
         sample_support = sample_size / (sample_size + 1.0)
         evidence_support = evidence_count / (evidence_count + 1.0)
@@ -307,8 +312,12 @@ class OwnedPolicy:
         stability = _clip(float(primary.get("stability") or 0.0))
         evidence_count = len({(e.get("key"), e.get("direction")) for e in state.get("evidence") or []})
         evidence_support = evidence_count / (evidence_count + 1.0)
-        boundary = 1.0 - min(1.0, abs(marketing - 0.5) * 2.0)
+        boundary = self._boundary(marketing)
         return {"uncertainty": 1.0 - confidence, "instability": 1.0 - stability, "evidence_support": evidence_support, "verdict_readiness": confidence * stability * evidence_support * (1.0 - boundary)}
+
+    def _boundary(self, marketing: float) -> float:
+        span = max(self.decision_threshold, 1.0 - self.decision_threshold, 1e-6)
+        return 1.0 - min(1.0, abs(marketing - self.decision_threshold) / span)
 
     def _score(self, action: str, features: list[float]) -> float:
         mean = _dot(self.profile.weights[action], features)
