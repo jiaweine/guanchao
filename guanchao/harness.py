@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from typing import Any
 
-from .detection import MarketingDetector
+from .detection import Calibration, MarketingDetector
 from .domain import RunEvent
 from .evolution import EvolutionEngine
 from .policy import OwnedPolicy
@@ -260,32 +262,113 @@ class AgentHarness:
                 previous.result()
             except Exception:
                 pass
-        if decision == "uncertain":
+
+        # The HTTP request can be retried or edited while the learning queue is
+        # busy. Always converge to the review row that is currently persisted,
+        # rather than trusting an older queued request payload.
+        stored_review = next(
+            (row for row in self.store.review_rows() if row.get("run_id") == run_id),
+            None,
+        )
+        if stored_review is None:
             return
+        decision = str(stored_review.get("decision") or decision)
+        actor = str(stored_review.get("reviewer") or actor)
+
         run = self.store.get_run(run_id)
         state = run.get("state") or {}
         trajectory = list(state.get("trajectory") or [])
         result = state.get("primary_result") or {}
         calibration = self.store.get_calibration()
-        predicted = float(result.get("marketing_likelihood") or 0.0) >= calibration.decision_threshold
-        human = decision == "confirm_marketing"
         profile = self.store.get_policy_profile()
-        profile.observe_review(trajectory, predicted == human)
-        self.store.save_policy_profile(profile)
-        report = EvolutionEngine().evolve(calibration, self.store.labeled_examples(), profile)
-        if report.accepted:
-            self.store.save_calibration(report.calibration)
+
+        produced = str(result.get("label") or "")
+        predicted: bool | None
+        if produced in {"明显营销倾向", "高度营销化"}:
+            predicted = True
+        elif produced == "更像普通创作者":
+            predicted = False
+        else:
+            predicted = None
+
+        profile_changed = False
+        review_correct: bool | None = None
+        if decision == "uncertain":
+            profile_changed = profile.clear_review(run_id)
+        else:
+            human = decision == "confirm_marketing"
+            review_correct = None if predicted is None else predicted == human
+            profile_changed = profile.observe_review(run_id, trajectory, review_correct)
+
+        examples = self.store.labeled_examples()
+        fingerprint = self._review_dataset_fingerprint(examples)
+        dataset_changed = fingerprint != profile.review_dataset_fingerprint
+        calibration_promoted = False
+        calibration_reset = False
+        report_examples = len(examples)
+
+        if dataset_changed:
+            counts = {label: sum(item.label == label for item in examples) for label in (0, 1)}
+            if min(counts.values(), default=0) >= 2:
+                report = EvolutionEngine().evolve(calibration, examples, profile)
+                report_examples = report.examples
+                calibration_promoted = report.accepted
+                if report.accepted:
+                    self.store.save_calibration(report.calibration)
+            elif profile.review_dataset_fingerprint and calibration != Calibration():
+                # A review can be withdrawn back to "uncertain". If that leaves
+                # no longer enough two-class evidence to validate the learned
+                # calibration, fall back to the cold-start prior rather than
+                # keeping parameters trained on supervision that no longer exists.
+                self.store.save_calibration(Calibration())
+                calibration_reset = True
+            profile.review_dataset_fingerprint = fingerprint
+
+        if profile_changed or dataset_changed:
+            self.store.save_policy_profile(profile)
+
+        if not profile_changed and not dataset_changed:
+            self.store.record_event(
+                "harness_review_feedback_noop",
+                actor=actor,
+                run_id=run_id,
+                metadata={"decision": decision},
+            )
+            return
+
         self.store.record_event(
             "harness_self_evolved",
             actor=actor,
             run_id=run_id,
             metadata={
-                "review_correct": predicted == human,
-                "calibration_promoted": report.accepted,
-                "examples": report.examples,
+                "review_correct": review_correct,
+                "calibration_promoted": calibration_promoted,
+                "calibration_reset": calibration_reset,
+                "examples": report_examples,
                 "policy_steps": profile.steps,
+                "review_feedback": len(profile.review_feedback),
             },
         )
+
+    @staticmethod
+    def _review_dataset_fingerprint(examples: list[Any]) -> str:
+        rows = [
+            {
+                "group": str(item.group),
+                "label": int(item.label),
+                "features": item.features.asdict(),
+            }
+            for item in examples
+        ]
+        rows.sort(
+            key=lambda row: (
+                row["group"],
+                row["label"],
+                json.dumps(row["features"], sort_keys=True, separators=(",", ":")),
+            )
+        )
+        payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _merge_evidence(state: dict[str, Any], items: list[dict[str, Any]]) -> None:
