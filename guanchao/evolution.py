@@ -206,6 +206,24 @@ class EvolutionEngine:
             if score > best_selective:
                 best_selective = score
                 best_margin = margin
+
+        # The high-confidence band must remain distinct from the ordinary positive
+        # band. Using threshold + abstain_margin directly makes every positive
+        # score outside the abstain band immediately "高度营销化" and collapses the
+        # intermediate "明显营销倾向" state after an evolution promotion.
+        upper_abstain = min(1.0, best_threshold + best_margin)
+        strong_positive = [
+            probability
+            for probability, label in zip(probabilities, labels)
+            if label == 1 and probability > upper_abstain
+        ]
+        high_threshold = (
+            statistics.median(strong_positive)
+            if strong_positive
+            else max(candidate.high_threshold, upper_abstain)
+        )
+        high_threshold = min(1.0, max(upper_abstain, high_threshold))
+
         return Calibration(
             bias=candidate.bias,
             weights=dict(candidate.weights),
@@ -214,7 +232,7 @@ class EvolutionEngine:
             semantic_weight=candidate.semantic_weight,
             decision_threshold=best_threshold,
             abstain_margin=best_margin,
-            high_threshold=min(1.0, best_threshold + best_margin),
+            high_threshold=high_threshold,
         )
 
     def _metric(self, calibration: Calibration, examples: list[LabeledExample]) -> float:
