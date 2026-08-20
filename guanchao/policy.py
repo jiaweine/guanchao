@@ -54,6 +54,11 @@ class PolicyProfile:
     a posterior mean vector and an inverse precision matrix. The initial state is
     deliberately uninformative; domain behaviour is acquired from executed
     trajectories and human review rather than hand-tuned action weights.
+
+    Human review is stored separately by run id instead of being folded directly
+    into the posterior. That makes retries idempotent and lets an edited review
+    replace or remove its previous feedback instead of stacking contradictory
+    gradients forever.
     """
 
     weights: dict[str, list[float]] = field(
@@ -65,6 +70,8 @@ class PolicyProfile:
     latency_ms: dict[str, float] = field(default_factory=dict)
     latency_count: dict[str, int] = field(default_factory=dict)
     experiences: list[dict[str, Any]] = field(default_factory=list)
+    review_feedback: dict[str, dict[str, Any]] = field(default_factory=dict)
+    review_dataset_fingerprint: str = ""
     steps: int = 0
     reviews: int = 0
 
@@ -99,12 +106,28 @@ class PolicyProfile:
             item for item in (raw.get("experiences") or [])
             if isinstance(item, dict) and item.get("action") in _ACTIONS
         ]
+        feedback: dict[str, dict[str, Any]] = {}
+        incoming_feedback = raw.get("review_feedback")
+        if isinstance(incoming_feedback, dict):
+            for run_id, item in incoming_feedback.items():
+                if not isinstance(item, dict):
+                    continue
+                features = item.get("features")
+                if not isinstance(features, list) or len(features) != _DIM:
+                    continue
+                reward = max(-1.0, min(1.0, float(item.get("reward") or 0.0)))
+                feedback[str(run_id)] = {
+                    "features": [float(value) for value in features],
+                    "reward": reward,
+                }
         return cls(
             weights=weights,
             covariance=covariance,
             latency_ms={k: float(v) for k, v in (raw.get("latency_ms") or {}).items() if k in _ACTIONS},
             latency_count={k: int(v) for k, v in (raw.get("latency_count") or {}).items() if k in _ACTIONS},
             experiences=experiences,
+            review_feedback=feedback,
+            review_dataset_fingerprint=str(raw.get("review_dataset_fingerprint") or ""),
             steps=max(0, int(raw.get("steps") or 0)),
             reviews=max(0, int(raw.get("reviews") or 0)),
         )
@@ -132,25 +155,36 @@ class PolicyProfile:
             self._remember(action, features, reward)
             self.steps += 1
 
-    def observe_review(self, trajectory: list[dict[str, Any]], correct: bool) -> None:
+    def observe_review(
+        self,
+        run_id: str,
+        trajectory: list[dict[str, Any]],
+        correct: bool | None,
+    ) -> bool:
         verdicts = [item for item in trajectory if item.get("action") == "verdict.compose"]
-        if verdicts:
-            item = verdicts[-1]
-            features = [float(v) for v in item.get("features") or []]
-            if len(features) == _DIM:
-                reward = 1.0 if correct else -1.0
-                self._recursive_update("verdict.compose", features, reward)
-                alternative = str(item.get("alternative") or "")
-                alternative_features = [float(v) for v in item.get("alternative_features") or []]
-                if alternative in _ACTIONS and len(alternative_features) == _DIM:
-                    self._preference_update(
-                        "verdict.compose" if correct else alternative,
-                        features if correct else alternative_features,
-                        alternative if correct else "verdict.compose",
-                        alternative_features if correct else features,
-                        1.0,
-                    )
-        self.reviews += 1
+        if not verdicts:
+            return False
+        features = [float(v) for v in verdicts[-1].get("features") or []]
+        if len(features) != _DIM:
+            return False
+        feedback = {
+            "features": features,
+            "reward": 0.0 if correct is None else 1.0 if correct else -1.0,
+        }
+        previous = self.review_feedback.get(run_id)
+        if previous == feedback:
+            return False
+        if previous is None:
+            self.reviews += 1
+        self.review_feedback[run_id] = feedback
+        return True
+
+    def clear_review(self, run_id: str) -> bool:
+        if run_id not in self.review_feedback:
+            return False
+        self.review_feedback.pop(run_id, None)
+        self.reviews = max(0, self.reviews - 1)
+        return True
 
     def _recursive_update(self, action: str, x: list[float], reward: float) -> None:
         covariance = self.covariance[action]
@@ -290,15 +324,35 @@ class OwnedPolicy:
             similarity = _cosine(features, [float(v) for v in other])
             if similarity > 0:
                 replay_rows.append((similarity, float(item.get("reward") or 0.0)))
-        if replay_rows:
-            replay_rows.sort(reverse=True)
-            replay_rows = replay_rows[: max(1, math.ceil(math.sqrt(len(replay_rows))))]
-            replay_precision = sum(similarity for similarity, _ in replay_rows)
-            model_precision = 1.0 / variance
-            replay_value = sum(similarity * reward for similarity, reward in replay_rows) / replay_precision
-            mean = (model_precision * mean + replay_precision * replay_value) / (model_precision + replay_precision)
+        mean = self._blend_replay(mean, variance, replay_rows)
+
+        if action == "verdict.compose":
+            review_rows: list[tuple[float, float]] = []
+            for item in self.profile.review_feedback.values():
+                other = item.get("features") or []
+                reward = float(item.get("reward") or 0.0)
+                if not isinstance(other, list) or len(other) != _DIM or abs(reward) <= 1e-9:
+                    continue
+                similarity = _cosine(features, [float(v) for v in other])
+                if similarity > 0:
+                    review_rows.append((similarity, reward))
+            mean = self._blend_replay(mean, variance, review_rows)
+
         exploration = math.sqrt(variance * math.log(self.profile.steps + 2.0))
         return mean + exploration
+
+    @staticmethod
+    def _blend_replay(mean: float, variance: float, rows: list[tuple[float, float]]) -> float:
+        if not rows:
+            return mean
+        rows.sort(key=lambda row: row[0], reverse=True)
+        rows = rows[: max(1, math.ceil(math.sqrt(len(rows))))]
+        replay_precision = sum(similarity for similarity, _ in rows)
+        if replay_precision <= 0.0:
+            return mean
+        model_precision = 1.0 / variance
+        replay_value = sum(similarity * reward for similarity, reward in rows) / replay_precision
+        return (model_precision * mean + replay_precision * replay_value) / (model_precision + replay_precision)
 
     @staticmethod
     def _available(state: dict[str, Any], completed: set[str]) -> list[str]:
