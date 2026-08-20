@@ -9,8 +9,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from typing import Any
 
 from .detection import Calibration, MarketingDetector
-from .domain import RunEvent
-from .evolution import EvolutionEngine
+from .domain import FeatureVector, RunEvent
+from .evolution import EvolutionEngine, LabeledExample
 from .policy import OwnedPolicy
 from .semantic import SemanticEvidenceGateway
 from .store import Store
@@ -326,7 +326,7 @@ class AgentHarness:
             review_correct = None if predicted is None else predicted == human
             profile_changed = profile.observe_review(run_id, trajectory, review_correct)
 
-        examples = self.store.labeled_examples()
+        examples = self._review_examples()
         fingerprint = self._review_dataset_fingerprint(examples)
         dataset_changed = fingerprint != profile.review_dataset_fingerprint
         calibration_promoted = False
@@ -375,6 +375,44 @@ class AgentHarness:
                 "review_feedback": len(profile.review_feedback),
             },
         )
+
+    def _review_examples(self) -> list[LabeledExample]:
+        # A case can be investigated repeatedly. Treating every run as an
+        # independent review leaks the same account across cross-validation
+        # folds and lets prolific cases dominate calibration. The latest human
+        # review is the case-level supervision state; an "uncertain" latest
+        # review withdraws that case from decisive training entirely.
+        latest: dict[str, dict[str, Any]] = {}
+        for row in self.store.review_rows():
+            case_id = str(row.get("case_id") or "")
+            if not case_id:
+                continue
+            previous = latest.get(case_id)
+            if previous is None or str(row.get("updated_at") or "") >= str(previous.get("updated_at") or ""):
+                latest[case_id] = row
+
+        examples: list[LabeledExample] = []
+        for case_id, row in latest.items():
+            decision = str(row.get("decision") or "")
+            if decision == "uncertain":
+                continue
+            try:
+                reviewed_run = self.store.get_run(str(row.get("run_id") or ""))
+                features = (reviewed_run.get("state") or {}).get("primary_result", {}).get("features")
+                if not isinstance(features, dict):
+                    continue
+                vector = FeatureVector(**features)
+            except (KeyError, TypeError, ValueError):
+                continue
+            examples.append(
+                LabeledExample(
+                    vector,
+                    1 if decision == "confirm_marketing" else 0,
+                    case_id,
+                )
+            )
+        examples.sort(key=lambda item: item.group)
+        return examples
 
     @staticmethod
     def _review_dataset_fingerprint(examples: list[Any]) -> str:
