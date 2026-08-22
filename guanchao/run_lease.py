@@ -376,17 +376,30 @@ def active_or_reclaim(
 
 
 def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
-    """Sweep crashed owners globally so stale cases do not consume capacity."""
+    """Sweep only globally stale candidates, not every healthy running case."""
+    now = _parse(now_iso) or _utcnow()
+    missing_cutoff = now - timedelta(seconds=legacy_grace_seconds())
     rows = conn.execute(
         """
-        SELECT DISTINCT r.case_id
+        SELECT r.case_id, r.created_at, l.lease_until
         FROM runs r LEFT JOIN run_leases l ON l.run_id = r.id
         WHERE r.status = 'running'
         """
     ).fetchall()
-    reclaimed = 0
+    candidates: set[str] = set()
     for row in rows:
-        _, changed = active_or_reclaim(conn, str(row["case_id"]), now_iso)
+        if row["lease_until"] is not None:
+            deadline = _parse(row["lease_until"])
+            if deadline is None or deadline <= now:
+                candidates.add(str(row["case_id"]))
+            continue
+        created = _parse(row["created_at"])
+        if created is not None and created <= missing_cutoff:
+            candidates.add(str(row["case_id"]))
+
+    reclaimed = 0
+    for case_id in candidates:
+        _, changed = active_or_reclaim(conn, case_id, now_iso)
         reclaimed += int(changed)
     return reclaimed
 
