@@ -82,20 +82,11 @@ def _db_key(db_path: str) -> str:
 
 
 def _db_identity(db_path: str) -> tuple[int, int] | None:
-    """Identify the concrete database file behind a stable configured path.
-
-    The lease schema cache is process-local. Caching by path alone is unsafe when
-    tests, restore jobs, or operators replace a SQLite file in place: the process
-    would otherwise keep assuming the old file's triggers/tables still exist.
-    Device+inode is stable across normal writes but changes on replacement.
-    """
     try:
         stat = Path(db_path).stat()
     except OSError:
         return None
     identity = (int(stat.st_dev), int(stat.st_ino))
-    # Some filesystems expose no useful inode identity. In that case correctness
-    # wins over the micro-optimization and schema installation remains idempotent.
     return None if identity == (0, 0) else identity
 
 
@@ -119,57 +110,38 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 
 def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) -> None:
-    """Install run ownership, global capacity, and terminal-state invariants."""
+    """Install run ownership, global capacity, and terminal-state invariants.
+
+    Callers that need cross-process atomicity should open an IMMEDIATE transaction
+    before entering this function. Every statement here is deliberately executed
+    through `execute` rather than `executescript`, because executescript performs
+    transaction-boundary behaviour that would break that migration lock.
+    """
     lease_table_existed = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_leases'"
     ).fetchone() is not None
-    conn.executescript(
+
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS run_leases (
             run_id TEXT PRIMARY KEY,
             worker_id TEXT NOT NULL,
             lease_until TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_run_leases_until ON run_leases(lease_until);
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_leases_until ON run_leases(lease_until)")
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS run_runtime_limits (
             id INTEGER PRIMARY KEY CHECK(id = 1),
             max_inflight INTEGER NOT NULL CHECK(max_inflight >= 1),
             updated_at TEXT NOT NULL
-        );
-        CREATE TRIGGER IF NOT EXISTS trg_runs_global_capacity_insert
-        BEFORE INSERT ON runs
-        WHEN NEW.status = 'running'
-        BEGIN
-            SELECT CASE WHEN
-                (SELECT COUNT(*) FROM runs WHERE status = 'running') >=
-                COALESCE((SELECT max_inflight FROM run_runtime_limits WHERE id = 1), 256)
-            THEN RAISE(ABORT, 'global run capacity reached') END;
-        END;
-        CREATE TRIGGER IF NOT EXISTS trg_runs_global_capacity_update
-        BEFORE UPDATE OF status ON runs
-        WHEN NEW.status = 'running' AND OLD.status != 'running'
-        BEGIN
-            SELECT CASE WHEN
-                (SELECT COUNT(*) FROM runs WHERE status = 'running') >=
-                COALESCE((SELECT max_inflight FROM run_runtime_limits WHERE id = 1), 256)
-            THEN RAISE(ABORT, 'global run capacity reached') END;
-        END;
-        CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_immutable
-        BEFORE UPDATE ON runs
-        WHEN OLD.status IN ('completed', 'failed')
-             AND (NEW.status != OLD.status OR NEW.state_json != OLD.state_json)
-        BEGIN
-            SELECT RAISE(ABORT, 'terminal run is immutable');
-        END;
-        CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_release_lease
-        AFTER UPDATE OF status ON runs
-        WHEN NEW.status != 'running'
-        BEGIN
-            DELETE FROM run_leases WHERE run_id = NEW.id;
-        END;
+        )
         """
     )
+
     now = _iso(_utcnow())
     conn.execute(
         """
@@ -179,6 +151,54 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
             updated_at = excluded.updated_at
         """,
         (configured_global_inflight(), now),
+    )
+
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_global_capacity_insert
+        BEFORE INSERT ON runs
+        WHEN NEW.status = 'running'
+        BEGIN
+            SELECT CASE WHEN
+                (SELECT COUNT(*) FROM runs WHERE status = 'running') >=
+                COALESCE((SELECT max_inflight FROM run_runtime_limits WHERE id = 1), 256)
+            THEN RAISE(ABORT, 'global run capacity reached') END;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_global_capacity_update
+        BEFORE UPDATE OF status ON runs
+        WHEN NEW.status = 'running' AND OLD.status != 'running'
+        BEGIN
+            SELECT CASE WHEN
+                (SELECT COUNT(*) FROM runs WHERE status = 'running') >=
+                COALESCE((SELECT max_inflight FROM run_runtime_limits WHERE id = 1), 256)
+            THEN RAISE(ABORT, 'global run capacity reached') END;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_immutable
+        BEFORE UPDATE ON runs
+        WHEN OLD.status IN ('completed', 'failed')
+             AND (NEW.status != OLD.status OR NEW.state_json != OLD.state_json)
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal run is immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_release_lease
+        AFTER UPDATE OF status ON runs
+        WHEN NEW.status != 'running'
+        BEGIN
+            DELETE FROM run_leases WHERE run_id = NEW.id;
+        END
+        """
     )
 
     if not lease_table_existed:
@@ -205,6 +225,10 @@ def _ensure_path_schema(db_path: str) -> None:
             return
         conn = _connect(db_path)
         try:
+            # Serialize first-install/upgrade against every SQLite writer in every
+            # process. Tables, configured limit, triggers and legacy adoption then
+            # become visible as one state instead of a partially-installed schema.
+            conn.execute("BEGIN IMMEDIATE")
             ensure_schema(conn)
             conn.commit()
             current_identity = _db_identity(db_path)
@@ -212,6 +236,12 @@ def _ensure_path_schema(db_path: str) -> None:
                 _SCHEMA_READY[key] = current_identity
             else:
                 _SCHEMA_READY.pop(key, None)
+        except BaseException:
+            try:
+                conn.rollback()
+            finally:
+                _SCHEMA_READY.pop(key, None)
+            raise
         finally:
             conn.close()
 
@@ -270,13 +300,7 @@ def active_or_reclaim(
     now_iso: str,
     missing_grace_seconds: int = 30,
 ) -> tuple[sqlite3.Row | None, bool]:
-    """Return a live running row or atomically fail an expired owner.
-
-    A fresh unleased row is deliberately left unmodified. Harness creates the run
-    and then explicitly claims its lease before executor submission. Another
-    worker that merely observes this tiny create/adopt window must not manufacture
-    a legacy owner and thereby sabotage the real creator's confirmation.
-    """
+    """Return a live running row or atomically fail an expired owner."""
     row = conn.execute(
         """
         SELECT r.*, l.worker_id AS lease_worker_id, l.lease_until
@@ -316,8 +340,6 @@ def active_or_reclaim(
         ).fetchone()
         return current, False
 
-    # Terminal transition trigger removes the lease. Keep this idempotent delete
-    # for databases created by an older schema where that trigger was absent.
     conn.execute(
         "DELETE FROM run_leases WHERE run_id = ? AND lease_until = ?",
         (row["id"], old_deadline),
@@ -345,9 +367,6 @@ def active_or_reclaim(
 def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
     """Sweep crashed owners globally so stale cases do not consume capacity."""
     now = _parse(now_iso) or _utcnow()
-    # If a mixed-version worker starts a run after the lease table already exists,
-    # it cannot attach ownership. Preserve the rolling-upgrade grace window before
-    # treating an unleased row as a crashed new-code creator.
     missing_cutoff = now - timedelta(seconds=legacy_grace_seconds())
     rows = conn.execute(
         """
