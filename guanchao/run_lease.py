@@ -132,6 +132,9 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_run_leases_until ON run_leases(lease_until)")
+    # Capacity triggers count running rows across every case. The Store's
+    # (case_id, status, created_at) index cannot serve a status-only predicate.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS run_runtime_limits (
@@ -225,9 +228,6 @@ def _ensure_path_schema(db_path: str) -> None:
             return
         conn = _connect(db_path)
         try:
-            # Serialize first-install/upgrade against every SQLite writer in every
-            # process. Tables, configured limit, triggers and legacy adoption then
-            # become visible as one state instead of a partially-installed schema.
             conn.execute("BEGIN IMMEDIATE")
             ensure_schema(conn)
             conn.commit()
