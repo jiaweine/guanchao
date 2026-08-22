@@ -13,7 +13,7 @@ from .detection import Calibration, MarketingDetector
 from .domain import FeatureVector, RunEvent
 from .evolution import EvolutionEngine, EvolutionReport, LabeledExample
 from .policy import OwnedPolicy
-from .run_lease import is_global_capacity_error
+from .run_lease import is_global_capacity_error, observe_running_case
 from .run_lock import run_claim
 from .semantic import SemanticEvidenceGateway
 from .store import Store
@@ -82,6 +82,7 @@ class AgentHarness:
             with self._guard:
                 self._ensure_open()
                 run_id = self._prepare_run(case_id, message, actor)
+                self._confirm_run_lease(case_id, run_id)
                 self._submit(run_id)
                 return run_id
         except Exception:
@@ -102,7 +103,11 @@ class AgentHarness:
             with self._guard:
                 self._ensure_open()
                 for case_id in case_ids:
-                    prepared.append((case_id, self._prepare_run(case_id, message, actor)))
+                    run_id = self._prepare_run(case_id, message, actor)
+                    # Append before confirmation so any adoption failure has a
+                    # durable run_id that the shared cleanup path can fail safely.
+                    prepared.append((case_id, run_id))
+                    self._confirm_run_lease(case_id, run_id)
                 for _, run_id in prepared:
                     self._submit(run_id)
                     submitted += 1
@@ -128,6 +133,13 @@ class AgentHarness:
                     self._capacity.release()
                 raise RunCapacityError(f"inflight capacity {self._max_inflight} reached")
             acquired += 1
+
+    def _confirm_run_lease(self, case_id: str, run_id: str) -> None:
+        if self.store.path == ":memory:":
+            return
+        adopted = observe_running_case(self.store.path, case_id)
+        if adopted != run_id:
+            raise RuntimeError(f"durable run lease was not acquired for {run_id}")
 
     def _prepare_run(self, case_id: str, message: str, actor: str) -> str:
         with run_claim(self.store.path, case_id):
@@ -158,9 +170,6 @@ class AgentHarness:
                 "trajectory": [],
             }
             try:
-                # User message, running row and run_started audit event are one
-                # SQLite transaction. If the DB-level single-running invariant
-                # rejects this claim, no ghost chat message or orphan run survives.
                 run = self.store.create_run(
                     case_id,
                     state,
@@ -168,8 +177,6 @@ class AgentHarness:
                     user_message=message,
                 )
             except sqlite3.IntegrityError as exc:
-                # Preserve same-case conflict semantics even if both the unique
-                # index and global-capacity trigger could reject this INSERT.
                 active = self.store.active_run_for_case(case_id)
                 if active:
                     raise ActiveRunError(active["id"]) from None
