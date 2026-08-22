@@ -82,6 +82,48 @@ def test_two_harness_instances_cannot_claim_the_same_case_simultaneously(tmp_pat
     second.close()
 
 
+def test_db_running_conflict_rolls_back_user_message_atomically(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "atomic-run.sqlite"))
+    case = store.create_case("原子启动", "核查", [_target()])
+    existing = store.create_run(case["id"], {"goal": "占位", "targets": [_target()]})
+    harness = AgentHarness(store)
+    original_active = store.active_run_for_case
+    calls = 0
+
+    def stale_then_real(case_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return original_active(case_id)
+
+    monkeypatch.setattr(store, "active_run_for_case", stale_then_real)
+    before = [
+        item["content"]
+        for item in store.get_case(case["id"])["messages"]
+        if item["role"] == "user"
+    ]
+    try:
+        try:
+            harness._prepare_run(case["id"], "不应残留的消息", "local")
+        except ActiveRunError as exc:
+            assert str(exc) == existing["id"]
+        else:
+            raise AssertionError("DB-level running collision was not translated")
+
+        after = [
+            item["content"]
+            for item in store.get_case(case["id"])["messages"]
+            if item["role"] == "user"
+        ]
+        assert after == before
+        assert _running_count(store, case["id"]) == 1
+    finally:
+        current = store.get_run(existing["id"])
+        store.update_run(existing["id"], current["state"], "failed")
+        harness.close()
+
+
 def test_async_http_case_claim_reenters_harness_start_without_deadlock(tmp_path):
     app = create_app(str(tmp_path / "reentrant.sqlite"))
     setup = TestClient(app)
