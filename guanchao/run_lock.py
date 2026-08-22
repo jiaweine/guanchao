@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 
+from .run_lease import observe_running_case, prepare_case_claim
+
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.Lock] = {}
 _HELD_CLAIMS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
@@ -99,15 +101,30 @@ def _release_file(descriptor: int | None) -> None:
         os.close(descriptor)
 
 
+def _lease_case(case_id: str) -> bool:
+    # Internal global claims (currently learning reconciliation) are serialized
+    # by the same primitive but are not case/run ownership claims.
+    return bool(case_id) and not case_id.startswith("__guanchao_")
+
+
+def _before_case_claim(db_path: str, case_id: str) -> None:
+    if _lease_case(case_id):
+        prepare_case_claim(db_path, case_id)
+
+
+def _after_case_claim(db_path: str, case_id: str) -> None:
+    if _lease_case(case_id):
+        observe_running_case(db_path, case_id)
+
+
 @contextmanager
 def run_claim(db_path: str, case_id: str) -> Iterator[None]:
     """Serialize all evidence-snapshot mutations for one case.
 
-    This is deliberately broader than just run creation. The same claim can be
-    held by HTTP mutations (target/assets/archive/delete) and by Harness.start().
-    A ContextVar makes nested acquisition re-entrant even when FastAPI moves the
-    inner synchronous endpoint to a worker thread, while flock extends the claim
-    across processes that share the SQLite file.
+    Besides mutual exclusion, the outermost durable case claim now reconciles run
+    ownership: an expired crashed worker is failed before the caller inspects the
+    active row, and a run created inside the claim is adopted by this process and
+    heartbeated after the durable snapshot is committed.
     """
 
     key, path = _identity(db_path, case_id)
@@ -120,12 +137,19 @@ def run_claim(db_path: str, case_id: str) -> Iterator[None]:
     lock.acquire()
     descriptor: int | None = None
     token: contextvars.Token[frozenset[str]] | None = None
+    completed = False
     try:
         if path is not None:
             descriptor = _acquire_file_blocking(path)
+        _before_case_claim(db_path, case_id)
         token = _HELD_CLAIMS.set(held | {key})
         yield
+        completed = True
     finally:
+        # Only adopt on a normally completed claim. A rejected/failed mutation may
+        # have observed somebody else's live run and must never claim its lease.
+        if completed:
+            _after_case_claim(db_path, case_id)
         if token is not None:
             _HELD_CLAIMS.reset(token)
         _release_file(descriptor)
@@ -137,8 +161,9 @@ async def async_run_claim(db_path: str, case_id: str) -> AsyncIterator[None]:
     """Async, cancellation-safe form of :func:`run_claim`.
 
     Acquisition uses non-blocking polling instead of parking a thread in flock or
-    Lock.acquire. If the request is cancelled while waiting, no background thread
-    can later acquire and leak the lock.
+    Lock.acquire. Lease reconciliation itself is deliberately tiny SQLite work and
+    runs while the cross-process case claim is held, so a cancelled request cannot
+    leave a background adoption task racing after the lock has been released.
     """
 
     key, path = _identity(db_path, case_id)
@@ -151,6 +176,7 @@ async def async_run_claim(db_path: str, case_id: str) -> AsyncIterator[None]:
     acquired_thread_lock = False
     descriptor: int | None = None
     token: contextvars.Token[frozenset[str]] | None = None
+    completed = False
     try:
         while not lock.acquire(blocking=False):
             await asyncio.sleep(0.01)
@@ -162,9 +188,13 @@ async def async_run_claim(db_path: str, case_id: str) -> AsyncIterator[None]:
                 if descriptor is None:
                     await asyncio.sleep(0.01)
 
+        _before_case_claim(db_path, case_id)
         token = _HELD_CLAIMS.set(held | {key})
         yield
+        completed = True
     finally:
+        if completed:
+            _after_case_claim(db_path, case_id)
         if token is not None:
             _HELD_CLAIMS.reset(token)
         _release_file(descriptor)
