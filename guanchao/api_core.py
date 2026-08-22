@@ -13,7 +13,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .domain import AccountSnapshot
-from .evolution import EvolutionEngine
 from .harness import ActiveRunError, AgentHarness, RunCapacityError
 from .multimodal import PerceptionGateway, infer_kind
 from .post_training import PostTrainingCorpusBuilder
@@ -21,7 +20,16 @@ from .reporting import ReportBuilder
 from .sample_data import demo_target
 from .store import Store
 
-MAX_UPLOAD_BYTES = int(os.getenv("GUANCHAO_MAX_UPLOAD_MB", "30")) * 1024 * 1024
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+MAX_UPLOAD_BYTES = _env_int("GUANCHAO_MAX_UPLOAD_MB", 30, 1, 512) * 1024 * 1024
 
 
 class CaseCreate(BaseModel):
@@ -99,6 +107,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app.state.store = store
     app.state.harness = harness
     app.state.perception = perception
+    # Repeated app creation is common in tests and worker reloads. Explicitly
+    # closing both harness executors prevents thread accumulation across lifecycles.
+    app.add_event_handler("shutdown", harness.close)
     trust_actor_header = os.getenv("GUANCHAO_TRUST_ACTOR_HEADER", "0").strip().lower() in {"1", "true", "yes"}
     view_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
     view_cache_lock = threading.RLock()
@@ -383,6 +394,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if payload.rerun:
             try:
                 run_id = harness.start(case_id, payload.message.strip(), actor=current["id"])
+            except ActiveRunError as exc:
+                raise HTTPException(409, f"当前任务已有核查在进行：{exc}") from exc
             except RunCapacityError as exc:
                 raise HTTPException(429, "当前核查队列已满，请稍后重新发起") from exc
         return {"case": case, "run_id": run_id}
@@ -568,13 +581,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/evolution/run")
     def evolve(request: Request) -> dict[str, Any]:
         current = require(request, {"admin"})
-        engine = EvolutionEngine()
-        report = engine.evolve(
-            store.get_calibration(), store.labeled_examples(), store.get_policy_profile()
-        )
-        if report.accepted:
-            store.save_calibration(report.calibration)
-            store.save_policy_profile(report.policy_profile)
+        # Manual and automatic evolution must use the exact same serialized,
+        # case-deduplicated supervision pipeline. Running a second implementation
+        # here previously let an admin retrain on stale per-run labels.
+        report = harness.evolve_now(actor=current["id"])
         store.record_event(
             "learning_run",
             actor=current["id"],
