@@ -19,7 +19,7 @@ class RunLeaseLostError(RuntimeError):
 
 
 _SCHEMA_GUARD = threading.Lock()
-_SCHEMA_READY: set[str] = set()
+_SCHEMA_READY: dict[str, tuple[int, int]] = {}
 _WORKER_GUARD = threading.Lock()
 _WORKER_PID = -1
 _WORKER_TOKEN = ""
@@ -79,6 +79,24 @@ def _deadline(seconds: int) -> str:
 
 def _db_key(db_path: str) -> str:
     return str(Path(db_path).expanduser().resolve())
+
+
+def _db_identity(db_path: str) -> tuple[int, int] | None:
+    """Identify the concrete database file behind a stable configured path.
+
+    The lease schema cache is process-local. Caching by path alone is unsafe when
+    tests, restore jobs, or operators replace a SQLite file in place: the process
+    would otherwise keep assuming the old file's triggers/tables still exist.
+    Device+inode is stable across normal writes but changes on replacement.
+    """
+    try:
+        stat = Path(db_path).stat()
+    except OSError:
+        return None
+    identity = (int(stat.st_dev), int(stat.st_ino))
+    # Some filesystems expose no useful inode identity. In that case correctness
+    # wins over the micro-optimization and schema installation remains idempotent.
+    return None if identity == (0, 0) else identity
 
 
 def worker_id() -> str:
@@ -144,6 +162,12 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
         BEGIN
             SELECT RAISE(ABORT, 'terminal run is immutable');
         END;
+        CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_release_lease
+        AFTER UPDATE OF status ON runs
+        WHEN NEW.status != 'running'
+        BEGIN
+            DELETE FROM run_leases WHERE run_id = NEW.id;
+        END;
         """
     )
     now = _iso(_utcnow())
@@ -175,14 +199,19 @@ def _ensure_path_schema(db_path: str) -> None:
     if not db_path or db_path == ":memory:":
         return
     key = _db_key(db_path)
+    identity = _db_identity(db_path)
     with _SCHEMA_GUARD:
-        if key in _SCHEMA_READY:
+        if identity is not None and _SCHEMA_READY.get(key) == identity:
             return
         conn = _connect(db_path)
         try:
             ensure_schema(conn)
             conn.commit()
-            _SCHEMA_READY.add(key)
+            current_identity = _db_identity(db_path)
+            if current_identity is not None:
+                _SCHEMA_READY[key] = current_identity
+            else:
+                _SCHEMA_READY.pop(key, None)
         finally:
             conn.close()
 
@@ -241,7 +270,13 @@ def active_or_reclaim(
     now_iso: str,
     missing_grace_seconds: int = 30,
 ) -> tuple[sqlite3.Row | None, bool]:
-    """Return a live running row or atomically fail an expired owner."""
+    """Return a live running row or atomically fail an expired owner.
+
+    A fresh unleased row is deliberately left unmodified. Harness creates the run
+    and then explicitly claims its lease before executor submission. Another
+    worker that merely observes this tiny create/adopt window must not manufacture
+    a legacy owner and thereby sabotage the real creator's confirmation.
+    """
     row = conn.execute(
         """
         SELECT r.*, l.worker_id AS lease_worker_id, l.lease_until
@@ -262,11 +297,6 @@ def active_or_reclaim(
 
     old_deadline = row["lease_until"]
     if old_deadline is None:
-        grace = _deadline(missing_grace_seconds)
-        conn.execute(
-            "INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until) VALUES (?, 'legacy-worker', ?)",
-            (row["id"], grace),
-        )
         return row, False
 
     changed = conn.execute(
@@ -286,6 +316,8 @@ def active_or_reclaim(
         ).fetchone()
         return current, False
 
+    # Terminal transition trigger removes the lease. Keep this idempotent delete
+    # for databases created by an older schema where that trigger was absent.
     conn.execute(
         "DELETE FROM run_leases WHERE run_id = ? AND lease_until = ?",
         (row["id"], old_deadline),
@@ -313,7 +345,10 @@ def active_or_reclaim(
 def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
     """Sweep crashed owners globally so stale cases do not consume capacity."""
     now = _parse(now_iso) or _utcnow()
-    missing_cutoff = now - timedelta(seconds=30)
+    # If a mixed-version worker starts a run after the lease table already exists,
+    # it cannot attach ownership. Preserve the rolling-upgrade grace window before
+    # treating an unleased row as a crashed new-code creator.
+    missing_cutoff = now - timedelta(seconds=legacy_grace_seconds())
     rows = conn.execute(
         """
         SELECT DISTINCT r.case_id, r.created_at, l.lease_until
@@ -398,8 +433,6 @@ class _HeartbeatRegistry:
 
     @staticmethod
     def _retry_interval(seconds: int) -> float:
-        # Retry fast enough that one transient SQLite lock cannot consume the
-        # whole remaining lease window, but avoid a busy loop during an outage.
         return max(0.25, min(2.0, seconds / 10.0))
 
     def register(self, db_path: str, run_id: str, seconds: int) -> None:
@@ -436,8 +469,6 @@ class _HeartbeatRegistry:
                 try:
                     self._renew(item)
                 except Exception:
-                    # The daemon must survive one unexpected renewal bug. Keep the
-                    # registration and retry rather than silently losing liveness.
                     self._reschedule(item, retry=True)
             self._wake.wait(0.25)
             self._wake.clear()
