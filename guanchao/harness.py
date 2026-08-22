@@ -13,6 +13,7 @@ from .detection import Calibration, MarketingDetector
 from .domain import FeatureVector, RunEvent
 from .evolution import EvolutionEngine, EvolutionReport, LabeledExample
 from .policy import OwnedPolicy
+from .run_lease import is_global_capacity_error
 from .run_lock import run_claim
 from .semantic import SemanticEvidenceGateway
 from .store import Store
@@ -166,10 +167,16 @@ class AgentHarness:
                     actor=actor,
                     user_message=message,
                 )
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                # Preserve same-case conflict semantics even if both the unique
+                # index and global-capacity trigger could reject this INSERT.
                 active = self.store.active_run_for_case(case_id)
                 if active:
                     raise ActiveRunError(active["id"]) from None
+                if is_global_capacity_error(exc):
+                    raise RunCapacityError(
+                        f"inflight capacity {self._max_inflight} reached"
+                    ) from None
                 raise
             self._active_cases[case_id] = run["id"]
             return run["id"]
