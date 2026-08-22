@@ -128,9 +128,6 @@ class EvolutionEngine:
             feature_key = "|".join(
                 f"{value:.6f}" for value in item.features.asdict().values()
             )
-            # An empty group means the caller considers this row independent;
-            # include its row index so identical feature vectors are not silently
-            # merged into one group.
             key = item.group or f"__row__:{index}:{item.label}:{feature_key}"
             grouped.setdefault(key, []).append(item)
 
@@ -140,8 +137,6 @@ class EvolutionEngine:
                 label: sum(item.label == label for item in rows)
                 for label in (0, 1)
             }
-            # Mixed-label groups are unusual but still stay intact. Assign them
-            # to their majority class only for balancing; tie breaks are stable.
             balance_label = 1 if label_counts[1] > label_counts[0] else 0
             payload = group + "|" + "|".join(
                 f"{item.label}:" + ",".join(
@@ -152,9 +147,6 @@ class EvolutionEngine:
             digest = hashlib.sha256(payload.encode()).hexdigest()
             by_class.setdefault(balance_label, []).append((digest, rows))
 
-        # Round-robin whole groups within each class. Starting each class at fold
-        # zero keeps per-class counts balanced while the hash makes assignment
-        # deterministic across process restarts.
         for label in sorted(by_class):
             for index, (_, rows) in enumerate(sorted(by_class[label], key=lambda row: row[0])):
                 folds[index % k].extend(rows)
@@ -243,21 +235,23 @@ class EvolutionEngine:
                 best_selective = score
                 best_margin = margin
 
-        # The high-confidence band must remain distinct from the ordinary positive
-        # band. Using threshold + abstain_margin directly makes every positive
-        # score outside the abstain band immediately "高度营销化" and collapses the
-        # intermediate "明显营销倾向" state after an evolution promotion.
         upper_abstain = min(1.0, best_threshold + best_margin)
         strong_positive = [
             probability
             for probability, label in zip(probabilities, labels)
             if label == 1 and probability > upper_abstain
         ]
-        high_threshold = (
-            statistics.median(strong_positive)
-            if strong_positive
-            else max(candidate.high_threshold, upper_abstain)
-        )
+        if strong_positive:
+            high_threshold = statistics.median(strong_positive)
+        elif candidate.high_threshold > upper_abstain:
+            high_threshold = candidate.high_threshold
+        else:
+            # No observed positive example supports a separate high-confidence
+            # label yet. Put the high threshold at the top of the probability
+            # range instead of collapsing it onto the abstain edge. This keeps
+            # ordinary positive scores representable as "明显营销倾向" and makes
+            # "高度营销化" conservative until evidence actually supports it.
+            high_threshold = 1.0
         high_threshold = min(1.0, max(upper_abstain, high_threshold))
 
         return Calibration(
