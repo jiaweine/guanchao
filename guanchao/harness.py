@@ -71,7 +71,6 @@ class AgentHarness:
         self._learning_future: Future | None = None
 
     def close(self) -> None:
-        """Finish durable work and release executor threads exactly once."""
         with self._guard:
             if self._closed:
                 return
@@ -86,9 +85,6 @@ class AgentHarness:
         try:
             with self._guard:
                 self._ensure_open()
-                # Global stale-owner cleanup is needed only when a new running row
-                # may consume shared capacity. Ordinary case mutations now avoid
-                # this workspace-wide sweep entirely.
                 prepare_run_start(self.store.path)
                 run_id = self._prepare_run(case_id, message, actor)
                 self._confirm_run_lease(case_id, run_id)
@@ -111,8 +107,6 @@ class AgentHarness:
         try:
             with self._guard:
                 self._ensure_open()
-                # One sweep is enough for the whole batch. Repeating it once per
-                # case makes large batch creation quadratic in the running set.
                 prepare_run_start(self.store.path)
                 for case_id in case_ids:
                     run_id = self._prepare_run(case_id, message, actor)
@@ -436,10 +430,7 @@ class AgentHarness:
     ) -> None:
         self._await_previous(previous)
         with run_claim(self.store.path, _LEARNING_CLAIM):
-            stored_review = next(
-                (row for row in self.store.review_rows() if row.get("run_id") == run_id),
-                None,
-            )
+            stored_review = self.store.review_for_run(run_id)
             if stored_review is None:
                 return
             decision = str(stored_review.get("decision") or decision)
