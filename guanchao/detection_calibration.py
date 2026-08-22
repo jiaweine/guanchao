@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from .detection_support import _clip_range
+
+
+def _finite_float(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
 
 
 @dataclass(slots=True)
@@ -60,29 +69,54 @@ class Calibration:
     @classmethod
     def from_dict(cls, raw: dict[str, object] | None) -> "Calibration":
         base = cls()
-        if not raw:
+        if not raw or not isinstance(raw, dict):
             return base
-        bias = float(raw.get("bias", base.bias))
+        bias = _finite_float(raw.get("bias", base.bias), base.bias)
         weights = dict(base.weights)
         incoming = raw.get("weights")
         if isinstance(incoming, dict):
             for key in weights:
                 if key in incoming:
-                    weights[key] = float(incoming[key])
+                    weights[key] = _finite_float(incoming[key], weights[key])
         interactions = dict(base.interactions)
         incoming_interactions = raw.get("interactions")
         if isinstance(incoming_interactions, dict):
             for key in interactions:
                 if key in incoming_interactions:
-                    interactions[key] = float(incoming_interactions[key])
-        temperature = _clip_range(float(raw.get("temperature", base.temperature)), 0.1, 10.0)
-        semantic_weight = _clip_range(float(raw.get("semantic_weight", base.semantic_weight)), 0.0, 1.0)
-        decision_threshold = _clip_range(float(raw.get("decision_threshold", base.decision_threshold)), 0.01, 0.99)
-        abstain_margin = _clip_range(float(raw.get("abstain_margin", base.abstain_margin)), 0.0, 0.49)
+                    interactions[key] = _finite_float(
+                        incoming_interactions[key], interactions[key]
+                    )
+        temperature = _clip_range(
+            _finite_float(raw.get("temperature", base.temperature), base.temperature),
+            0.1,
+            10.0,
+        )
+        semantic_weight = _clip_range(
+            _finite_float(raw.get("semantic_weight", base.semantic_weight), base.semantic_weight),
+            0.0,
+            1.0,
+        )
+        decision_threshold = _clip_range(
+            _finite_float(
+                raw.get("decision_threshold", base.decision_threshold),
+                base.decision_threshold,
+            ),
+            0.01,
+            0.99,
+        )
+        abstain_margin = _clip_range(
+            _finite_float(raw.get("abstain_margin", base.abstain_margin), base.abstain_margin),
+            0.0,
+            0.49,
+        )
         maximum_band = max(0.0, min(decision_threshold, 1.0 - decision_threshold))
         effective_abstain = min(maximum_band, abstain_margin)
         high_floor = min(1.0, decision_threshold + effective_abstain)
-        high_threshold = _clip_range(float(raw.get("high_threshold", base.high_threshold)), high_floor, 1.0)
+        high_threshold = _clip_range(
+            _finite_float(raw.get("high_threshold", base.high_threshold), base.high_threshold),
+            high_floor,
+            1.0,
+        )
         return cls(
             bias=bias,
             weights=weights,
