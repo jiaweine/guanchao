@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 
-from .run_lease import observe_running_case, prepare_case_claim
+from .run_lease import prepare_case_claim
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.Lock] = {}
@@ -103,23 +103,16 @@ def _before_case_claim(db_path: str, case_id: str) -> None:
         prepare_case_claim(db_path, case_id)
 
 
-def _after_case_claim(db_path: str, case_id: str) -> None:
-    if not _lease_case(case_id):
-        return
-    try:
-        # This hook is supplementary. Harness.start performs a mandatory lease
-        # confirmation after it has the durable run_id and before executor submit,
-        # where failures can be rolled back to a failed run deterministically.
-        # A post-commit housekeeping failure must never turn an otherwise valid
-        # case mutation into a 500 or strand a run before the caller knows its id.
-        observe_running_case(db_path, case_id)
-    except Exception:
-        return
-
-
 @contextmanager
 def run_claim(db_path: str, case_id: str) -> Iterator[None]:
-    """Serialize evidence-snapshot mutations and reclaim expired run owners."""
+    """Serialize evidence-snapshot mutations and reclaim expired run owners.
+
+    Claim ownership is intentionally not granted here. Only AgentHarness may
+    adopt a newly-created running row, after it knows the exact durable run_id and
+    before it submits work to the executor. A generic case mutation must never be
+    able to steal or manufacture run ownership merely because it observed a fresh
+    unleased row during that tiny create/adopt window.
+    """
 
     key, path = _identity(db_path, case_id)
     held = _HELD_CLAIMS.get()
@@ -131,17 +124,13 @@ def run_claim(db_path: str, case_id: str) -> Iterator[None]:
     lock.acquire()
     descriptor: int | None = None
     token: contextvars.Token[frozenset[str]] | None = None
-    completed = False
     try:
         if path is not None:
             descriptor = _acquire_file_blocking(path)
         _before_case_claim(db_path, case_id)
         token = _HELD_CLAIMS.set(held | {key})
         yield
-        completed = True
     finally:
-        if completed:
-            _after_case_claim(db_path, case_id)
         if token is not None:
             _HELD_CLAIMS.reset(token)
         _release_file(descriptor)
@@ -162,7 +151,6 @@ async def async_run_claim(db_path: str, case_id: str) -> AsyncIterator[None]:
     acquired_thread_lock = False
     descriptor: int | None = None
     token: contextvars.Token[frozenset[str]] | None = None
-    completed = False
     try:
         while not lock.acquire(blocking=False):
             await asyncio.sleep(0.01)
@@ -177,10 +165,7 @@ async def async_run_claim(db_path: str, case_id: str) -> AsyncIterator[None]:
         _before_case_claim(db_path, case_id)
         token = _HELD_CLAIMS.set(held | {key})
         yield
-        completed = True
     finally:
-        if completed:
-            _after_case_claim(db_path, case_id)
         if token is not None:
             _HELD_CLAIMS.reset(token)
         _release_file(descriptor)
