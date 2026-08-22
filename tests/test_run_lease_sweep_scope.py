@@ -31,8 +31,6 @@ def test_generic_case_claim_does_not_scan_all_running_runs(tmp_path, monkeypatch
     store = Store(db)
     case = store.create_case("普通写锁", "核查", [_target("case-only")])
 
-    # Install runtime schema before replacing the global sweep so this assertion
-    # measures claim semantics rather than first-install work.
     lease_module.prepare_case_claim(db, case["id"])
 
     def forbidden_global_sweep(*args, **kwargs):
@@ -41,6 +39,40 @@ def test_generic_case_claim_does_not_scan_all_running_runs(tmp_path, monkeypatch
     monkeypatch.setattr(lease_module, "reclaim_expired_runs", forbidden_global_sweep)
     with run_claim(db, case["id"]):
         assert store.get_case(case["id"])["id"] == case["id"]
+
+
+def test_stale_same_case_unleased_run_is_recovered_without_global_sweep(tmp_path):
+    db = str(tmp_path / "same-case-orphan.sqlite")
+    store = Store(db)
+    case = store.create_case("同案无租约恢复", "核查", [_target("same-case-orphan")])
+
+    # Install the new runtime schema first, then emulate a creator that committed a
+    # running row but died before explicit lease confirmation.
+    lease_module.prepare_case_claim(db, case["id"])
+    run = store.create_run(case["id"], {"goal": "崩溃窗口", "targets": [_target("same-case-orphan")]})
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE runs SET created_at = ?, updated_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", run["id"]),
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM run_leases WHERE run_id = ?", (run["id"],)
+        ).fetchone() is None
+    finally:
+        store._close(conn)
+
+    with run_claim(db, case["id"]):
+        assert store.active_run_for_case(case["id"]) is None
+
+    assert store.get_run(run["id"])["status"] == "failed"
+    assert any(
+        event["event_type"] == "run_lease_expired"
+        and event["run_id"] == run["id"]
+        and event["metadata"].get("worker_id") == "orphaned-worker"
+        for event in store.audit_events(case_id=case["id"], limit=50)
+    )
 
 
 def test_batch_start_runs_one_global_reclaim_sweep_for_the_whole_batch(tmp_path, monkeypatch):
