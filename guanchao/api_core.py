@@ -185,9 +185,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return candidate[:64]
 
     def extract_with_capacity(storage_path: str, kind: str, content_type: str) -> tuple[str, str]:
-        # Use the event loop's worker pool only as transport. The explicit
-        # semaphore is the product-level capacity limit and remains held even if
-        # the HTTP coroutine is cancelled while perception is still executing.
         with perception_slots:
             return perception.extract(storage_path, kind, content_type)
 
@@ -205,8 +202,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 result = await asyncio.shield(task)
                 return result, None, cancelled
             except asyncio.CancelledError as exc:
-                # Cancellation is remembered but not propagated until the worker
-                # finishes and the asset row is settled under the same case claim.
                 if cancelled is None:
                     cancelled = exc
                 continue
@@ -647,8 +642,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/post-training/export", response_class=PlainTextResponse)
     def export_post_training(request: Request) -> str:
         require(request, {"admin"})
-        cases = [store.get_case(item["id"]) for item in store.list_cases(status="all")]
-        return PostTrainingCorpusBuilder().build_jsonl(cases, store.review_rows())
+        return PostTrainingCorpusBuilder().build_jsonl_from_store(store)
 
     @app.post("/api/demo")
     def demo(request: Request) -> dict[str, Any]:
