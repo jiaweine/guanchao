@@ -1296,12 +1296,12 @@ class Store:
         for row in review_rows:
             decision = str(row["decision"] or "")
             review_time = _parse_time(row["updated_at"] or row["created_at"])
-            if review_time and review_time >= now - timedelta(days=7):
-                verified_recent += 1
             if decision == "uncertain":
                 uncertain_count += 1
                 continue
             decisive_count += 1
+            if review_time and review_time >= now - timedelta(days=7):
+                verified_recent += 1
 
             state = _safe_json(row["state_json"], {})
             result = state.get("primary_result") if isinstance(state, dict) else {}
