@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .api_core import MAX_UPLOAD_BYTES, create_app as create_core_app
 from .multimodal import infer_kind
+from .run_lock import async_run_claim
 
 IDEMPOTENCY_TTL_SECONDS = 600.0
 IDEMPOTENCY_CACHE_LIMIT = 256
@@ -161,9 +162,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         )
             if owner:
                 break
-            # All duplicate callers share this future. A disconnected/cancelled
-            # waiter must not cancel the shared synchronization primitive and
-            # poison every other retry waiting on the same idempotency key.
             record = await asyncio.shield(future)
             if record is not None:
                 return _response_from_record(record)
@@ -325,8 +323,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         async def serialized_dispatch():
             if _serialize_case_mutation(path, method, case_id):
+                # The asyncio lock prevents same-process coroutine crossings; the
+                # file-backed claim extends the exact same evidence-snapshot
+                # critical section to other app workers/processes. Harness.start
+                # uses the synchronous form and re-enters through ContextVar when
+                # a target refresh/message starts a run inside this request.
                 async with lock_for(case_id):
-                    return await dispatch()
+                    async with async_run_claim(app.state.store.path, case_id):
+                        return await dispatch()
             return await dispatch()
 
         base = _idempotency_base(request)
