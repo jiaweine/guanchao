@@ -4,7 +4,12 @@ from threading import Event
 import pytest
 
 from guanchao.harness import AgentHarness, RunCapacityError
-from guanchao.run_lease import shutdown_heartbeats
+from guanchao.run_lease import (
+    ensure_schema,
+    observe_running_case,
+    shutdown_heartbeats,
+    worker_id,
+)
 from guanchao.store import Store
 
 
@@ -57,9 +62,6 @@ def test_global_inflight_limit_is_shared_by_multiple_harnesses(tmp_path, monkeyp
         second.start(cases[1]["id"], "第二条")
         assert _running_total(first_store) == 2
 
-        # Each Harness still has local semaphore room. Only the SQLite-wide
-        # invariant can reject this third run, which proves worker counts do not
-        # multiply GUANCHAO_MAX_INFLIGHT.
         with pytest.raises(RunCapacityError):
             first.start(cases[2]["id"], "不应越过全局上限")
         assert _running_total(first_store) == 2
@@ -120,4 +122,49 @@ def test_expired_run_on_other_case_is_reclaimed_before_capacity_check(tmp_path, 
         release.set()
         first.close()
         second.close()
+        shutdown_heartbeats()
+
+
+def test_existing_lease_schema_does_not_steal_fresh_unleased_run(tmp_path):
+    db = str(tmp_path / "lease-migration-race.sqlite")
+    store = Store(db)
+    case = store.create_case("迁移竞态", "核查", [_target("migration-race")])
+
+    # First worker installs the shared schema before it creates a run.
+    conn = store._connect()
+    try:
+        ensure_schema(conn)
+        conn.commit()
+    finally:
+        store._close(conn)
+
+    run = store.create_run(case["id"], {"goal": "刚创建", "targets": [_target("migration-race")]})
+
+    # A second worker initializing the already-existing schema must not label the
+    # create/adopt window as legacy ownership.
+    conn = store._connect()
+    try:
+        ensure_schema(conn)
+        conn.commit()
+        lease = conn.execute(
+            "SELECT worker_id FROM run_leases WHERE run_id = ?", (run["id"],)
+        ).fetchone()
+        assert lease is None
+    finally:
+        store._close(conn)
+
+    try:
+        assert observe_running_case(db, case["id"]) == run["id"]
+        conn = store._connect()
+        try:
+            lease = conn.execute(
+                "SELECT worker_id FROM run_leases WHERE run_id = ?", (run["id"],)
+            ).fetchone()
+            assert lease is not None
+            assert lease["worker_id"] == worker_id()
+        finally:
+            store._close(conn)
+    finally:
+        current = store.get_run(run["id"])
+        store.update_run(run["id"], current["state"], "failed")
         shutdown_heartbeats()
