@@ -17,6 +17,7 @@ from .harness import ActiveRunError, AgentHarness, RunCapacityError
 from .multimodal import PerceptionGateway, infer_kind
 from .post_training import PostTrainingCorpusBuilder
 from .reporting import ReportBuilder
+from .run_lock import async_run_claim
 from .sample_data import demo_target
 from .store import Store
 
@@ -168,11 +169,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
         payload["result"] = compact_result(item.get("result")) or {}
         return payload
 
+    def mutation_case_id(request: Request) -> str | None:
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return None
+        parts = [part for part in request.url.path.split("/") if part]
+        if len(parts) < 3 or parts[0] != "api" or parts[1] != "cases":
+            return None
+        candidate = parts[2]
+        if candidate in {"batch"}:
+            return None
+        return candidate[:64]
+
     @app.middleware("http")
-    async def clear_cached_views_on_write(request: Request, call_next: Any) -> Response:
+    async def protect_case_mutations(request: Request, call_next: Any) -> Response:
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             invalidate_view_cache()
-        return await call_next(request)
+        case_id = mutation_case_id(request)
+        if not case_id:
+            return await call_next(request)
+        async with async_run_claim(store.path, case_id):
+            return await call_next(request)
 
     def actor(request: Request) -> dict[str, Any]:
         member_id = "local"
