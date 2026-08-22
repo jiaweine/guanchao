@@ -17,6 +17,18 @@ def _target() -> dict:
     }
 
 
+def _running_count(store: Store, case_id: str) -> int:
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE case_id = ? AND status = 'running'",
+            (case_id,),
+        ).fetchone()
+        return int(row[0])
+    finally:
+        store._close(conn)
+
+
 def test_two_harness_instances_cannot_claim_the_same_case_simultaneously(tmp_path, monkeypatch):
     db = str(tmp_path / "shared.sqlite")
     first_store = Store(db)
@@ -62,15 +74,7 @@ def test_two_harness_instances_cannot_claim_the_same_case_simultaneously(tmp_pat
     assert sorted(kind for kind, _ in outcomes) == ["active", "ok"]
     active = first_store.active_run_for_case(case["id"])
     assert active is not None
-    assert sum(
-        row[0]
-        for row in [
-            first_store._connect().execute(
-                "SELECT COUNT(*) FROM runs WHERE case_id = ? AND status = 'running'",
-                (case["id"],),
-            ).fetchone()
-        ]
-    ) == 1
+    assert _running_count(first_store, case["id"]) == 1
 
     # Clean up the deliberately frozen worker and durable row.
     first_store.update_run(active["id"], active["state"], "failed")
