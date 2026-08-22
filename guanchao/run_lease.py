@@ -308,8 +308,31 @@ def active_or_reclaim(
         return row, False
 
     old_deadline = row["lease_until"]
+    lease_worker_id = row["lease_worker_id"]
     if old_deadline is None:
-        return row, False
+        created = _parse(row["created_at"])
+        missing_cutoff = now - timedelta(seconds=legacy_grace_seconds())
+        if created is None or created > missing_cutoff:
+            return row, False
+        inserted = conn.execute(
+            """
+            INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until)
+            VALUES (?, 'orphaned-worker', ?)
+            """,
+            (row["id"], now_iso),
+        ).rowcount
+        if inserted != 1:
+            current = conn.execute(
+                """
+                SELECT r.*, l.worker_id AS lease_worker_id, l.lease_until
+                FROM runs r LEFT JOIN run_leases l ON l.run_id = r.id
+                WHERE r.id = ? AND r.status = 'running'
+                """,
+                (row["id"],),
+            ).fetchone()
+            return current, False
+        old_deadline = now_iso
+        lease_worker_id = "orphaned-worker"
 
     changed = conn.execute(
         """
@@ -340,7 +363,7 @@ def active_or_reclaim(
             row["id"],
             json.dumps(
                 {
-                    "worker_id": row["lease_worker_id"],
+                    "worker_id": lease_worker_id,
                     "lease_until": old_deadline,
                     "reason": "worker_lease_expired",
                 },
@@ -354,47 +377,22 @@ def active_or_reclaim(
 
 def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
     """Sweep crashed owners globally so stale cases do not consume capacity."""
-    now = _parse(now_iso) or _utcnow()
-    missing_cutoff = now - timedelta(seconds=legacy_grace_seconds())
     rows = conn.execute(
         """
-        SELECT DISTINCT r.case_id, r.created_at, l.lease_until
+        SELECT DISTINCT r.case_id
         FROM runs r LEFT JOIN run_leases l ON l.run_id = r.id
         WHERE r.status = 'running'
         """
     ).fetchall()
-    candidates: set[str] = set()
-    for row in rows:
-        case_id = str(row["case_id"])
-        deadline = _parse(row["lease_until"])
-        if row["lease_until"] is not None:
-            if deadline is None or deadline <= now:
-                candidates.add(case_id)
-            continue
-        created = _parse(row["created_at"])
-        if created is not None and created <= missing_cutoff:
-            conn.execute(
-                "INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until) "
-                "SELECT id, 'orphaned-worker', ? FROM runs "
-                "WHERE case_id = ? AND status = 'running' AND id NOT IN (SELECT run_id FROM run_leases)",
-                (now_iso, case_id),
-            )
-            candidates.add(case_id)
-
     reclaimed = 0
-    for case_id in candidates:
-        _, changed = active_or_reclaim(conn, case_id, now_iso)
+    for row in rows:
+        _, changed = active_or_reclaim(conn, str(row["case_id"]), now_iso)
         reclaimed += int(changed)
     return reclaimed
 
 
 def prepare_case_claim(db_path: str, case_id: str) -> bool:
-    """Reclaim only this case before a serialized evidence mutation.
-
-    Ordinary target/asset/archive writes should not scan every running task in the
-    workspace. Global stale-owner cleanup is reserved for `prepare_run_start`,
-    because only a new run needs to free capacity consumed by other cases.
-    """
+    """Reclaim only this case before a serialized evidence mutation."""
     if not db_path or db_path == ":memory:":
         return False
     _ensure_path_schema(db_path)
