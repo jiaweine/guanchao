@@ -175,6 +175,10 @@ def test_schema_cache_reinstalls_runtime_schema_after_database_file_replacement(
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='trg_runs_terminal_release_lease'"
         ).fetchone()
+        indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(runs)").fetchall()
+        }
+        assert "idx_runs_status" in indexes
     finally:
         conn.close()
     lease_module.shutdown_heartbeats()
@@ -185,7 +189,6 @@ def test_runtime_schema_migration_blocks_concurrent_writer_until_commit(tmp_path
     store = Store(db)
     case = store.create_case("原子迁移", "核查", [_target("atomic-schema")])
 
-    # Force the path through schema installation instead of a prior test's cache.
     lease_module._SCHEMA_READY.pop(lease_module._db_key(db), None)
     migration_entered = Event()
     release_migration = Event()
@@ -193,7 +196,6 @@ def test_runtime_schema_migration_blocks_concurrent_writer_until_commit(tmp_path
     original_ensure = lease_module.ensure_schema
 
     def blocked_ensure(conn, grace_seconds=None):
-        # _ensure_path_schema acquires BEGIN IMMEDIATE before calling this hook.
         migration_entered.set()
         assert release_migration.wait(3), "test did not release runtime migration"
         return original_ensure(conn, grace_seconds)
