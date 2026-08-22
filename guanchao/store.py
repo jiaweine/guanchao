@@ -7,10 +7,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, Iterator
 
 from .detection import Calibration
 from .domain import AssetSnapshot, FeatureVector, utcnow_iso
@@ -90,6 +91,22 @@ class Store:
     def _close(self, conn: sqlite3.Connection) -> None:
         if self._memory_conn is None:
             conn.close()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """Commit-or-rollback and always release a short-lived connection."""
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            finally:
+                self._close(conn)
+            raise
+        else:
+            self._close(conn)
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str) -> None:
@@ -222,10 +239,6 @@ class Store:
             ):
                 self._ensure_column(conn, "cases", name, definition)
 
-            # Older workers could race the active-run check and leave multiple
-            # durable running rows for one case. Repair those legacy collisions
-            # before adding the DB-level invariant so an upgrade never fails just
-            # because the protection is being introduced after the fact.
             now = utcnow_iso()
             duplicate_cases = conn.execute(
                 """
@@ -251,10 +264,15 @@ class Store:
                     (case_id, winner["id"]),
                 ).fetchall()
                 for row in stale:
-                    conn.execute(
-                        "UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?",
+                    updated = conn.execute(
+                        """
+                        UPDATE runs SET status = 'failed', updated_at = ?
+                        WHERE id = ? AND status = 'running'
+                        """,
                         (now, row["id"]),
-                    )
+                    ).rowcount
+                    if not updated:
+                        continue
                     conn.execute(
                         "INSERT INTO events VALUES (?, 'system', 'run_duplicate_recovered', ?, ?, ?, ?)",
                         (
@@ -315,17 +333,15 @@ class Store:
             "event_type": event_type,
             "case_id": case_id,
             "run_id": run_id,
-            "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+            "metadata_json": json.dumps(metadata or {}, ensure_ascii=False, allow_nan=False),
             "created_at": utcnow_iso(),
         }
         with self._lock:
-            conn = self._connect()
-            conn.execute(
-                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
-                tuple(item.values()),
-            )
-            conn.commit()
-            self._close(conn)
+            with self._transaction() as conn:
+                conn.execute(
+                    "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    tuple(item.values()),
+                )
         self._invalidate_metrics()
         return {**item, "metadata": metadata or {}}
 
@@ -851,30 +867,48 @@ class Store:
         )
         return item
 
-    def create_run(self, case_id: str, state: dict[str, Any], actor: str = "local") -> dict[str, Any]:
+    def create_run(
+        self,
+        case_id: str,
+        state: dict[str, Any],
+        actor: str = "local",
+        user_message: str | None = None,
+    ) -> dict[str, Any]:
         now = utcnow_iso()
         run_id = uuid.uuid4().hex[:12]
+        state_json = json.dumps(state, ensure_ascii=False, allow_nan=False)
+        message_id = uuid.uuid4().hex[:12] if user_message is not None else None
+        event_id = uuid.uuid4().hex[:12]
         with self._lock:
-            conn = self._connect()
-            conn.execute(
-                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?)",
-                (run_id, case_id, "running", json.dumps(state, ensure_ascii=False), now, now),
-            )
-            conn.commit()
-            self._close(conn)
-        self.record_event("run_started", actor=actor, case_id=case_id, run_id=run_id)
+            with self._transaction() as conn:
+                if user_message is not None and message_id is not None:
+                    conn.execute(
+                        "INSERT INTO messages VALUES (?, ?, 'user', ?, ?)",
+                        (message_id, case_id, user_message, now),
+                    )
+                    conn.execute("UPDATE cases SET updated_at = ? WHERE id = ?", (now, case_id))
+                conn.execute(
+                    "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?)",
+                    (run_id, case_id, "running", state_json, now, now),
+                )
+                conn.execute(
+                    "INSERT INTO events VALUES (?, ?, 'run_started', ?, ?, '{}', ?)",
+                    (event_id, actor or "local", case_id, run_id, now),
+                )
+        self._invalidate_metrics()
         return self.get_run(run_id)
 
     def update_run(self, run_id: str, state: dict[str, Any], status: str) -> None:
+        state_json = json.dumps(state, ensure_ascii=False, allow_nan=False)
         with self._lock:
-            conn = self._connect()
-            previous = conn.execute("SELECT case_id, status FROM runs WHERE id = ?", (run_id,)).fetchone()
-            conn.execute(
-                "UPDATE runs SET status = ?, state_json = ?, updated_at = ? WHERE id = ?",
-                (status, json.dumps(state, ensure_ascii=False), utcnow_iso(), run_id),
-            )
-            conn.commit()
-            self._close(conn)
+            with self._transaction() as conn:
+                previous = conn.execute(
+                    "SELECT case_id, status FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                conn.execute(
+                    "UPDATE runs SET status = ?, state_json = ?, updated_at = ? WHERE id = ?",
+                    (status, state_json, utcnow_iso(), run_id),
+                )
         if previous and status != previous["status"] and status in {"completed", "failed"}:
             self.record_event(
                 f"run_{status}",
@@ -1076,12 +1110,6 @@ class Store:
         return [self._review_row(row) for row in rows]
 
     def latest_review_snapshots(self) -> list[dict[str, Any]]:
-        """Return one latest human supervision row per case with its run state.
-
-        Review learning used to call review_rows() and then get_run() once or
-        twice per case. Keeping the join in SQLite makes each reconciliation a
-        constant number of DB round trips even when the review history is large.
-        """
         with self._lock:
             conn = self._connect()
             rows = conn.execute(
@@ -1490,17 +1518,16 @@ class Store:
         return parsed if isinstance(parsed, dict) else None
 
     def _save_setting(self, key: str, value: dict[str, Any]) -> None:
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False)
         with self._lock:
-            conn = self._connect()
-            conn.execute(
-                """
-                INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
-                """,
-                (key, json.dumps(value, ensure_ascii=False, allow_nan=False), utcnow_iso()),
-            )
-            conn.commit()
-            self._close(conn)
+            with self._transaction() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+                    """,
+                    (key, serialized, utcnow_iso()),
+                )
 
     def _remove_asset_file(self, storage_path: str) -> None:
         try:
