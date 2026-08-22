@@ -1,7 +1,12 @@
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
+import httpx
+from fastapi.testclient import TestClient
+
+from guanchao.api import create_app
 from guanchao.harness import ActiveRunError, AgentHarness
 from guanchao.store import Store
 
@@ -37,15 +42,10 @@ def test_two_harness_instances_cannot_claim_the_same_case_simultaneously(tmp_pat
     first = AgentHarness(first_store)
     second = AgentHarness(second_store)
 
-    # Keep the winning run in `running` long enough for the losing claimant to
-    # observe it. The old implementation still raced because each Harness had a
-    # different in-memory guard.
     release = Event()
     monkeypatch.setattr(first, "_execute", lambda run_id: release.wait(2))
     monkeypatch.setattr(second, "_execute", lambda run_id: release.wait(2))
 
-    # Widen the old check/insert race deterministically. With run_claim the second
-    # Harness cannot enter this delayed check until the first has inserted.
     first_active = first_store.active_run_for_case
     second_active = second_store.active_run_for_case
 
@@ -76,8 +76,103 @@ def test_two_harness_instances_cannot_claim_the_same_case_simultaneously(tmp_pat
     assert active is not None
     assert _running_count(first_store, case["id"]) == 1
 
-    # Clean up the deliberately frozen worker and durable row.
     first_store.update_run(active["id"], active["state"], "failed")
     release.set()
     first.close()
     second.close()
+
+
+def test_async_http_case_claim_reenters_harness_start_without_deadlock(tmp_path):
+    app = create_app(str(tmp_path / "reentrant.sqlite"))
+    setup = TestClient(app)
+    case = setup.post(
+        "/api/cases",
+        json={"title": "可重入锁", "goal": "核查", "targets": [_target()]},
+    ).json()
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    f"/api/cases/{case['id']}/messages",
+                    json={"content": "开始核查"},
+                ),
+                timeout=2,
+            )
+            assert response.status_code == 200
+            run_id = response.json()["run_id"]
+            await asyncio.to_thread(app.state.harness.wait, run_id, 10)
+            assert app.state.store.get_run(run_id)["status"] in {"completed", "failed"}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        app.state.harness.close()
+
+
+def test_cross_app_run_waits_for_same_case_asset_perception_snapshot(tmp_path, monkeypatch):
+    db = str(tmp_path / "shared-api.sqlite")
+    first_app = create_app(db)
+    setup = TestClient(first_app)
+    case = setup.post(
+        "/api/cases",
+        json={"title": "跨 worker 素材", "goal": "核查", "targets": [_target()]},
+    ).json()
+    second_app = create_app(db)
+
+    perception_entered = Event()
+    release_perception = Event()
+
+    def slow_extract(path, kind, content_type):
+        perception_entered.set()
+        assert release_perception.wait(3), "test did not release perception"
+        return "跨 worker 可核对素材事实", "ready"
+
+    monkeypatch.setattr(first_app.state.perception, "extract", slow_extract)
+
+    async def scenario():
+        first_transport = httpx.ASGITransport(app=first_app)
+        second_transport = httpx.ASGITransport(app=second_app)
+        async with (
+            httpx.AsyncClient(transport=first_transport, base_url="http://first") as first,
+            httpx.AsyncClient(transport=second_transport, base_url="http://second") as second,
+        ):
+            upload_task = asyncio.create_task(
+                first.post(
+                    f"/api/cases/{case['id']}/assets",
+                    files={"file": ("evidence.txt", b"evidence", "text/plain")},
+                )
+            )
+            assert await asyncio.to_thread(perception_entered.wait, 1)
+
+            run_task = asyncio.create_task(
+                second.post(
+                    f"/api/cases/{case['id']}/messages",
+                    json={"content": "素材稳定后开始"},
+                )
+            )
+            await asyncio.sleep(0.15)
+            assert not run_task.done(), "another worker crossed the in-flight asset snapshot"
+
+            release_perception.set()
+            uploaded, started = await asyncio.wait_for(
+                asyncio.gather(upload_task, run_task), timeout=4
+            )
+            assert uploaded.status_code == 200
+            assert uploaded.json()["status"] == "ready"
+            assert started.status_code == 200
+
+            run_id = started.json()["run_id"]
+            run = second_app.state.store.get_run(run_id)
+            assert run["state"]["assets"]
+            assert run["state"]["assets"][0]["status"] == "ready"
+            assert "跨 worker 可核对素材事实" in run["state"]["assets"][0]["extracted_text"]
+            await asyncio.to_thread(second_app.state.harness.wait, run_id, 10)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_perception.set()
+        first_app.state.harness.close()
+        second_app.state.harness.close()
