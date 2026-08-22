@@ -111,8 +111,21 @@ class Store:
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str) -> None:
         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        if name not in columns:
+        if name in columns:
+            return
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        except sqlite3.OperationalError:
+            # Two processes can both observe an old schema before either ALTER is
+            # committed. The loser may receive duplicate-column/lock fallout after
+            # the winner commits. Re-read the durable schema and suppress the
+            # exception only when the exact requested column now exists; every
+            # unrelated migration failure still propagates.
+            refreshed = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if name not in refreshed:
+                raise
 
     def _init(self) -> None:
         with self._lock:
@@ -1053,28 +1066,21 @@ class Store:
         now = utcnow_iso()
         review_id = uuid.uuid4().hex[:12]
         with self._lock:
-            conn = self._connect()
-            existing = conn.execute("SELECT id FROM reviews WHERE run_id = ?", (run_id,)).fetchone()
-            if existing:
-                review_id = existing["id"]
+            with self._transaction() as conn:
                 conn.execute(
                     """
-                    UPDATE reviews SET decision = ?, reason = ?, note = ?, reviewer = ?,
-                        features_json = ?, updated_at = ? WHERE run_id = ?
+                    INSERT INTO reviews(
+                        id, case_id, run_id, decision, reason, note, reviewer,
+                        features_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        decision = excluded.decision,
+                        reason = excluded.reason,
+                        note = excluded.note,
+                        reviewer = excluded.reviewer,
+                        features_json = excluded.features_json,
+                        updated_at = excluded.updated_at
                     """,
-                    (
-                        decision,
-                        reason.strip(),
-                        note.strip(),
-                        reviewer,
-                        json.dumps(features, ensure_ascii=False),
-                        now,
-                        run_id,
-                    ),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO reviews VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         review_id,
                         case_id,
@@ -1088,10 +1094,8 @@ class Store:
                         now,
                     ),
                 )
-            conn.execute("UPDATE cases SET updated_at = ? WHERE id = ?", (now, case_id))
-            conn.commit()
-            row = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
-            self._close(conn)
+                conn.execute("UPDATE cases SET updated_at = ? WHERE id = ?", (now, case_id))
+                row = conn.execute("SELECT * FROM reviews WHERE run_id = ?", (run_id,)).fetchone()
         self.record_event(
             "review_submitted",
             actor=reviewer,
@@ -1101,6 +1105,14 @@ class Store:
         )
         assert row is not None
         return self._review_row(row)
+
+    def review_for_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read one persisted review without scanning the whole supervision set."""
+        with self._lock:
+            conn = self._connect()
+            row = conn.execute("SELECT * FROM reviews WHERE run_id = ?", (run_id,)).fetchone()
+            self._close(conn)
+        return self._review_row(row) if row else None
 
     def review_rows(self) -> list[dict[str, Any]]:
         with self._lock:
