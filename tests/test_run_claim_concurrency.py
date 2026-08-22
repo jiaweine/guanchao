@@ -176,3 +176,64 @@ def test_cross_app_run_waits_for_same_case_asset_perception_snapshot(tmp_path, m
         release_perception.set()
         first_app.state.harness.close()
         second_app.state.harness.close()
+
+
+def test_learning_read_modify_write_is_serialized_across_harnesses(tmp_path, monkeypatch):
+    db = str(tmp_path / "shared-learning.sqlite")
+    first_store = Store(db)
+    second_store = Store(db)
+    first = AgentHarness(first_store)
+    second = AgentHarness(second_store)
+
+    first_read = Event()
+    second_read = Event()
+    release_first = Event()
+    original_first_get = first_store.get_policy_profile
+    original_second_get = second_store.get_policy_profile
+
+    def blocked_first_get():
+        profile = original_first_get()
+        first_read.set()
+        assert release_first.wait(3), "test did not release first learner"
+        return profile
+
+    def observed_second_get():
+        second_read.set()
+        return original_second_get()
+
+    monkeypatch.setattr(first_store, "get_policy_profile", blocked_first_get)
+    monkeypatch.setattr(second_store, "get_policy_profile", observed_second_get)
+
+    trajectory = [
+        {
+            "action": "verdict.compose",
+            "features": [1.0] * 11,
+            "alternative": "evidence.challenge",
+            "alternative_features": [0.5] * 11,
+            "reward": 0.5,
+            "duration_ms": 1.0,
+        }
+    ]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_job = executor.submit(
+                first._apply_trajectory_learning, "first-learning", trajectory
+            )
+            assert first_read.wait(1)
+            second_job = executor.submit(
+                second._apply_trajectory_learning, "second-learning", trajectory
+            )
+            time.sleep(0.15)
+            assert not second_read.is_set(), "second worker read stale learning state concurrently"
+            release_first.set()
+            first_job.result(timeout=3)
+            second_job.result(timeout=3)
+
+        profile = Store(db).get_policy_profile()
+        assert profile.steps == 2
+        assert len(profile.experiences) == 2
+    finally:
+        release_first.set()
+        first.close()
+        second.close()
