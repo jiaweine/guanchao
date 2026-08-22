@@ -107,8 +107,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app.state.store = store
     app.state.harness = harness
     app.state.perception = perception
-    # Repeated app creation is common in tests and worker reloads. Explicitly
-    # closing both harness executors prevents thread accumulation across lifecycles.
     app.add_event_handler("shutdown", harness.close)
     trust_actor_header = os.getenv("GUANCHAO_TRUST_ACTOR_HEADER", "0").strip().lower() in {"1", "true", "yes"}
     view_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
@@ -292,15 +290,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         limit: int = Query(default=200, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         actor(request)
-        key = ("cases", query, platform, status, owner, priority, sort, batch_id)
-        items = cached_view(
+        key = ("cases", query, platform, status, owner, priority, sort, batch_id, limit)
+        return cached_view(
             key,
             lambda: [
                 compact_case_summary(item)
-                for item in store.list_cases(query, platform, status, owner, priority, sort, batch_id)
+                for item in store.list_cases(
+                    query, platform, status, owner, priority, sort, batch_id, limit=limit
+                )
             ],
         )
-        return items[:limit]
 
     @app.post("/api/cases")
     def create_case(payload: CaseCreate, request: Request) -> dict[str, Any]:
@@ -527,15 +526,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         limit: int = Query(default=200, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         actor(request)
-        key = ("review-queue", reviewed, query, platform, owner, priority, sort)
-        items = cached_view(
+        key = ("review-queue", reviewed, query, platform, owner, priority, sort, limit)
+        return cached_view(
             key,
             lambda: [
                 compact_review_summary(item)
-                for item in store.review_queue(reviewed, query, platform, owner, priority, sort)
+                for item in store.review_queue(
+                    reviewed, query, platform, owner, priority, sort, limit=limit
+                )
             ],
         )
-        return items[:limit]
 
     @app.get("/api/monitoring")
     def monitoring_queue(request: Request, due_only: bool = True) -> list[dict[str, Any]]:
@@ -581,9 +581,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/evolution/run")
     def evolve(request: Request) -> dict[str, Any]:
         current = require(request, {"admin"})
-        # Manual and automatic evolution must use the exact same serialized,
-        # case-deduplicated supervision pipeline. Running a second implementation
-        # here previously let an admin retrain on stale per-run labels.
         report = harness.evolve_now(actor=current["id"])
         store.record_event(
             "learning_run",
