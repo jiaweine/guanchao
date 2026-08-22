@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+GLOBAL_CAPACITY_ERROR = "global run capacity reached"
+
 
 class RunLeaseLostError(RuntimeError):
     """The worker no longer owns the durable running row."""
@@ -29,6 +31,17 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(low, min(high, value))
+
+
+def configured_global_inflight() -> int:
+    """Mirror Harness capacity semantics, but enforce them once per SQLite DB."""
+    workers = _env_int("GUANCHAO_MAX_WORKERS", 8, 2, 128)
+    configured = _env_int("GUANCHAO_MAX_INFLIGHT", 256, 1, 100_000)
+    return max(workers, configured)
+
+
+def is_global_capacity_error(exc: BaseException) -> bool:
+    return GLOBAL_CAPACITY_ERROR in str(exc).lower()
 
 
 def lease_seconds() -> int:
@@ -88,12 +101,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 
 def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) -> None:
-    """Install run ownership and terminal-state invariants.
-
-    Existing mixed-version running rows receive a finite legacy grace lease.
-    Terminal runs are made immutable so a worker that lost its lease cannot
-    resurrect a row after another worker has reclaimed the case.
-    """
+    """Install run ownership, global capacity, and terminal-state invariants."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS run_leases (
@@ -103,6 +111,29 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
             FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_run_leases_until ON run_leases(lease_until);
+        CREATE TABLE IF NOT EXISTS run_runtime_limits (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            max_inflight INTEGER NOT NULL CHECK(max_inflight >= 1),
+            updated_at TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS trg_runs_global_capacity_insert
+        BEFORE INSERT ON runs
+        WHEN NEW.status = 'running'
+        BEGIN
+            SELECT CASE WHEN
+                (SELECT COUNT(*) FROM runs WHERE status = 'running') >=
+                COALESCE((SELECT max_inflight FROM run_runtime_limits WHERE id = 1), 256)
+            THEN RAISE(ABORT, 'global run capacity reached') END;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_runs_global_capacity_update
+        BEFORE UPDATE OF status ON runs
+        WHEN NEW.status = 'running' AND OLD.status != 'running'
+        BEGIN
+            SELECT CASE WHEN
+                (SELECT COUNT(*) FROM runs WHERE status = 'running') >=
+                COALESCE((SELECT max_inflight FROM run_runtime_limits WHERE id = 1), 256)
+            THEN RAISE(ABORT, 'global run capacity reached') END;
+        END;
         CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_immutable
         BEFORE UPDATE ON runs
         WHEN OLD.status IN ('completed', 'failed')
@@ -111,6 +142,16 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
             SELECT RAISE(ABORT, 'terminal run is immutable');
         END;
         """
+    )
+    now = _iso(_utcnow())
+    conn.execute(
+        """
+        INSERT INTO run_runtime_limits(id, max_inflight, updated_at) VALUES(1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            max_inflight = excluded.max_inflight,
+            updated_at = excluded.updated_at
+        """,
+        (configured_global_inflight(), now),
     )
     deadline = _deadline(grace_seconds or legacy_grace_seconds())
     conn.execute(
@@ -216,10 +257,6 @@ def active_or_reclaim(
 
     old_deadline = row["lease_until"]
     if old_deadline is None:
-        # The only normal new-code window without a lease is the few instructions
-        # between Store.create_run() and the surrounding case claim exiting. A
-        # crash there is indistinguishable from an old worker, so give it a short
-        # grace instead of immediately killing potentially live mixed-version work.
         grace = _deadline(missing_grace_seconds)
         conn.execute(
             "INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until) VALUES (?, 'legacy-worker', ?)",
@@ -268,16 +305,40 @@ def active_or_reclaim(
     return None, True
 
 
+def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
+    """Sweep crashed owners globally so stale cases do not consume capacity."""
+    now = _parse(now_iso) or _utcnow()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT r.case_id, l.lease_until
+        FROM runs r JOIN run_leases l ON l.run_id = r.id
+        WHERE r.status = 'running'
+        """
+    ).fetchall()
+    candidates = {
+        str(row["case_id"])
+        for row in rows
+        if (_parse(row["lease_until"]) is None or _parse(row["lease_until"]) <= now)
+    }
+    reclaimed = 0
+    for case_id in candidates:
+        _, changed = active_or_reclaim(conn, case_id, now_iso)
+        reclaimed += int(changed)
+    return reclaimed
+
+
 def prepare_case_claim(db_path: str, case_id: str) -> bool:
-    """Reclaim one expired running row before a serialized case mutation."""
+    """Reclaim expired runs before a serialized case mutation or run start."""
     if not db_path or db_path == ":memory:":
         return False
     _ensure_path_schema(db_path)
     conn = _connect(db_path)
     try:
-        _, reclaimed = active_or_reclaim(conn, case_id, _iso(_utcnow()))
+        now = _iso(_utcnow())
+        reclaimed = reclaim_expired_runs(conn, now)
+        _, same_case = active_or_reclaim(conn, case_id, now)
         conn.commit()
-        return reclaimed
+        return bool(reclaimed or same_case)
     except BaseException:
         conn.rollback()
         raise
@@ -306,8 +367,6 @@ class _HeartbeatRegistry:
         pid = os.getpid()
         if self._pid == pid:
             return
-        # A pre-fork child must not inherit registrations or thread bookkeeping
-        # from the parent process.
         self._pid = pid
         self._items = {}
         self._wake = threading.Event()
@@ -342,7 +401,6 @@ class _HeartbeatRegistry:
     def _run(self) -> None:
         while not self._stop.is_set():
             now = time.monotonic()
-            due: list[_Registration] = []
             with self._guard:
                 self._ensure_process()
                 due = [item for item in self._items.values() if item.next_renew_at <= now]
@@ -368,13 +426,12 @@ class _HeartbeatRegistry:
                 assert_and_renew(conn, item.run_id, owner, item.seconds)
                 conn.commit()
                 keep = True
-            else:
-                if row and row["status"] != "running" and row["worker_id"] == owner:
-                    conn.execute(
-                        "DELETE FROM run_leases WHERE run_id = ? AND worker_id = ?",
-                        (item.run_id, owner),
-                    )
-                    conn.commit()
+            elif row and row["status"] != "running" and row["worker_id"] == owner:
+                conn.execute(
+                    "DELETE FROM run_leases WHERE run_id = ? AND worker_id = ?",
+                    (item.run_id, owner),
+                )
+                conn.commit()
         except (sqlite3.Error, RunLeaseLostError):
             try:
                 conn.rollback()
@@ -442,8 +499,6 @@ def observe_running_case(db_path: str, case_id: str) -> str | None:
         else:
             deadline = _parse(row["lease_until"])
             if deadline is None or deadline <= _utcnow():
-                # Expiry/reclamation belongs to prepare_case_claim while the case
-                # claim is held. Never steal a foreign lease in the post-hook.
                 conn.commit()
                 return None
             conn.commit()
