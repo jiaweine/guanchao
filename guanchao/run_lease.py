@@ -34,7 +34,6 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
 
 
 def configured_global_inflight() -> int:
-    """Mirror Harness capacity semantics, but enforce them once per SQLite DB."""
     workers = _env_int("GUANCHAO_MAX_WORKERS", 8, 2, 128)
     configured = _env_int("GUANCHAO_MAX_INFLIGHT", 256, 1, 100_000)
     return max(workers, configured)
@@ -91,7 +90,6 @@ def _db_identity(db_path: str) -> tuple[int, int] | None:
 
 
 def worker_id() -> str:
-    """Return a process-unique identity, including after a pre-fork server fork."""
     global _WORKER_PID, _WORKER_TOKEN
     pid = os.getpid()
     with _WORKER_GUARD:
@@ -110,13 +108,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 
 def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) -> None:
-    """Install run ownership, global capacity, and terminal-state invariants.
-
-    Callers that need cross-process atomicity should open an IMMEDIATE transaction
-    before entering this function. Every statement here is deliberately executed
-    through `execute` rather than `executescript`, because executescript performs
-    transaction-boundary behaviour that would break that migration lock.
-    """
+    """Install run ownership, global capacity, and terminal-state invariants."""
     lease_table_existed = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_leases'"
     ).fetchone() is not None
@@ -132,8 +124,6 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_run_leases_until ON run_leases(lease_until)")
-    # Capacity triggers count running rows across every case. The Store's
-    # (case_id, status, created_at) index cannot serve a status-only predicate.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)")
     conn.execute(
         """
@@ -298,9 +288,7 @@ def active_or_reclaim(
     conn: sqlite3.Connection,
     case_id: str,
     now_iso: str,
-    missing_grace_seconds: int = 30,
 ) -> tuple[sqlite3.Row | None, bool]:
-    """Return a live running row or atomically fail an expired owner."""
     row = conn.execute(
         """
         SELECT r.*, l.worker_id AS lease_worker_id, l.lease_until
@@ -401,17 +389,37 @@ def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
 
 
 def prepare_case_claim(db_path: str, case_id: str) -> bool:
-    """Reclaim expired runs before a serialized case mutation or run start."""
+    """Reclaim only this case before a serialized evidence mutation.
+
+    Ordinary target/asset/archive writes should not scan every running task in the
+    workspace. Global stale-owner cleanup is reserved for `prepare_run_start`,
+    because only a new run needs to free capacity consumed by other cases.
+    """
     if not db_path or db_path == ":memory:":
         return False
     _ensure_path_schema(db_path)
     conn = _connect(db_path)
     try:
-        now = _iso(_utcnow())
-        reclaimed = reclaim_expired_runs(conn, now)
-        _, same_case = active_or_reclaim(conn, case_id, now)
+        _, changed = active_or_reclaim(conn, case_id, _iso(_utcnow()))
         conn.commit()
-        return bool(reclaimed or same_case)
+        return bool(changed)
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def prepare_run_start(db_path: str) -> int:
+    """Free globally expired owners immediately before creating a new run."""
+    if not db_path or db_path == ":memory:":
+        return 0
+    _ensure_path_schema(db_path)
+    conn = _connect(db_path)
+    try:
+        reclaimed = reclaim_expired_runs(conn, _iso(_utcnow()))
+        conn.commit()
+        return reclaimed
     except BaseException:
         conn.rollback()
         raise
@@ -624,5 +632,4 @@ def observe_running_case(db_path: str, case_id: str) -> str | None:
 
 
 def shutdown_heartbeats() -> None:
-    """Test/process shutdown hook. Normal process exit also stops the daemon."""
     _HEARTBEATS.shutdown()
