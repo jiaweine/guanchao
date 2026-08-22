@@ -18,6 +18,8 @@ from .store import Store
 from .tools import ToolRegistry
 from .verifier import ResultVerifier
 
+_LEARNING_CLAIM = "__guanchao_learning_state__"
+
 
 class ActiveRunError(RuntimeError):
     pass
@@ -371,14 +373,18 @@ class AgentHarness:
         previous: Future | None = None,
     ) -> None:
         self._await_previous(previous)
-        profile = self.store.get_policy_profile()
-        profile.observe(trajectory)
-        self.store.save_policy_profile(profile)
-        self.store.record_event(
-            "harness_experience_replayed",
-            run_id=run_id,
-            metadata={"steps": len(trajectory), "policy_steps": profile.steps},
-        )
+        # Each worker has its own single-thread learning executor. Serialize the
+        # durable read-modify-write as well, otherwise two workers can both read
+        # the same profile and the last save silently loses the other's update.
+        with run_claim(self.store.path, _LEARNING_CLAIM):
+            profile = self.store.get_policy_profile()
+            profile.observe(trajectory)
+            self.store.save_policy_profile(profile)
+            self.store.record_event(
+                "harness_experience_replayed",
+                run_id=run_id,
+                metadata={"steps": len(trajectory), "policy_steps": profile.steps},
+            )
 
     @staticmethod
     def _await_previous(previous: Future | None) -> None:
@@ -397,65 +403,66 @@ class AgentHarness:
         previous: Future | None = None,
     ) -> None:
         self._await_previous(previous)
-        stored_review = next(
-            (row for row in self.store.review_rows() if row.get("run_id") == run_id),
-            None,
-        )
-        if stored_review is None:
-            return
-        decision = str(stored_review.get("decision") or decision)
-        actor = str(stored_review.get("reviewer") or actor)
-
-        run = self.store.get_run(run_id)
-        state = run.get("state") or {}
-        result = state.get("primary_result") or {}
-        predicted = _produced_marketing(str(result.get("label") or ""))
-        review_correct: bool | None = None
-        if decision != "uncertain":
-            human = decision == "confirm_marketing"
-            review_correct = None if predicted is None else predicted == human
-
-        profile = self.store.get_policy_profile()
-        profile_changed = self._sync_review_feedback(profile)
-        examples = self.review_examples()
-        fingerprint = self._review_dataset_fingerprint(examples)
-        dataset_changed = fingerprint != profile.review_dataset_fingerprint
-        calibration_promoted = False
-        calibration_reset = False
-        report_examples = len(examples)
-
-        if dataset_changed:
-            report, calibration_promoted, calibration_reset = self._fit_review_dataset(
-                examples, profile
+        with run_claim(self.store.path, _LEARNING_CLAIM):
+            stored_review = next(
+                (row for row in self.store.review_rows() if row.get("run_id") == run_id),
+                None,
             )
-            report_examples = report.examples
-            profile.review_dataset_fingerprint = fingerprint
+            if stored_review is None:
+                return
+            decision = str(stored_review.get("decision") or decision)
+            actor = str(stored_review.get("reviewer") or actor)
 
-        if profile_changed or dataset_changed:
-            self.store.save_policy_profile(profile)
+            run = self.store.get_run(run_id)
+            state = run.get("state") or {}
+            result = state.get("primary_result") or {}
+            predicted = _produced_marketing(str(result.get("label") or ""))
+            review_correct: bool | None = None
+            if decision != "uncertain":
+                human = decision == "confirm_marketing"
+                review_correct = None if predicted is None else predicted == human
 
-        if not profile_changed and not dataset_changed:
+            profile = self.store.get_policy_profile()
+            profile_changed = self._sync_review_feedback(profile)
+            examples = self.review_examples()
+            fingerprint = self._review_dataset_fingerprint(examples)
+            dataset_changed = fingerprint != profile.review_dataset_fingerprint
+            calibration_promoted = False
+            calibration_reset = False
+            report_examples = len(examples)
+
+            if dataset_changed:
+                report, calibration_promoted, calibration_reset = self._fit_review_dataset(
+                    examples, profile
+                )
+                report_examples = report.examples
+                profile.review_dataset_fingerprint = fingerprint
+
+            if profile_changed or dataset_changed:
+                self.store.save_policy_profile(profile)
+
+            if not profile_changed and not dataset_changed:
+                self.store.record_event(
+                    "harness_review_feedback_noop",
+                    actor=actor,
+                    run_id=run_id,
+                    metadata={"decision": decision},
+                )
+                return
+
             self.store.record_event(
-                "harness_review_feedback_noop",
+                "harness_self_evolved",
                 actor=actor,
                 run_id=run_id,
-                metadata={"decision": decision},
+                metadata={
+                    "review_correct": review_correct,
+                    "calibration_promoted": calibration_promoted,
+                    "calibration_reset": calibration_reset,
+                    "examples": report_examples,
+                    "policy_steps": profile.steps,
+                    "review_feedback": len(profile.review_feedback),
+                },
             )
-            return
-
-        self.store.record_event(
-            "harness_self_evolved",
-            actor=actor,
-            run_id=run_id,
-            metadata={
-                "review_correct": review_correct,
-                "calibration_promoted": calibration_promoted,
-                "calibration_reset": calibration_reset,
-                "examples": report_examples,
-                "policy_steps": profile.steps,
-                "review_feedback": len(profile.review_feedback),
-            },
-        )
 
     def _apply_manual_evolution(
         self,
@@ -463,13 +470,14 @@ class AgentHarness:
         previous: Future | None = None,
     ) -> EvolutionReport:
         self._await_previous(previous)
-        profile = self.store.get_policy_profile()
-        self._sync_review_feedback(profile)
-        examples = self.review_examples()
-        report, _, _ = self._fit_review_dataset(examples, profile)
-        profile.review_dataset_fingerprint = self._review_dataset_fingerprint(examples)
-        self.store.save_policy_profile(profile)
-        return report
+        with run_claim(self.store.path, _LEARNING_CLAIM):
+            profile = self.store.get_policy_profile()
+            self._sync_review_feedback(profile)
+            examples = self.review_examples()
+            report, _, _ = self._fit_review_dataset(examples, profile)
+            profile.review_dataset_fingerprint = self._review_dataset_fingerprint(examples)
+            self.store.save_policy_profile(profile)
+            return report
 
     def _fit_review_dataset(
         self,
