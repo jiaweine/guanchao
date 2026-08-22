@@ -1,6 +1,8 @@
 import json
 
+from guanchao.domain import FeatureVector
 from guanchao.post_training import PostTrainingCorpusBuilder
+from guanchao.store import Store
 
 
 def test_post_training_export_binds_review_to_exact_run():
@@ -44,3 +46,57 @@ def test_post_training_export_binds_review_to_exact_run():
     assert rows[0]["human_label"] == 1
     assert rows[0]["trajectory"][0]["tool"] == "content.scan"
     assert rows[0]["review"]["reason"] == "证据充分"
+
+
+def test_store_export_uses_one_query_and_never_loads_full_case_histories(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "post-training.sqlite"))
+    target = {
+        "platform": "weibo",
+        "handle": "training-one-query",
+        "posts": [{"id": "p1", "text": "今天散步"}],
+    }
+    case = store.create_case("训练导出", "核查", [target])
+    state = {
+        "goal": "精确复核",
+        "targets": [target],
+        "assets": [],
+        "events": [
+            {"kind": "tool", "tool": "content.scan", "status": "done", "detail": "完成"}
+        ],
+        "answer": "更像普通创作者",
+        "primary_result": {
+            "label": "更像普通创作者",
+            "features": FeatureVector().asdict(),
+        },
+    }
+    run = store.create_run(case["id"], state)
+    store.update_run(run["id"], state, "completed")
+    store.add_review(case["id"], run["id"], "confirm_ordinary", reason="人工确认")
+
+    monkeypatch.setattr(
+        store,
+        "get_case",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("optimized export must not load full case history")
+        ),
+    )
+    calls = 0
+    original_connect = store._connect
+
+    def counted_connect():
+        nonlocal calls
+        calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(store, "_connect", counted_connect)
+    rows = [
+        json.loads(line)
+        for line in PostTrainingCorpusBuilder().build_jsonl_from_store(store).splitlines()
+    ]
+    assert calls == 1
+    assert len(rows) == 1
+    assert rows[0]["case_id"] == case["id"]
+    assert rows[0]["run_id"] == run["id"]
+    assert rows[0]["goal"] == "精确复核"
+    assert rows[0]["human_label"] == 0
+    assert rows[0]["review"]["reason"] == "人工确认"
