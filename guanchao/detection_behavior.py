@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 import statistics
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import combinations
 
 from .domain import AccountSnapshot, Evidence, FeatureVector, PostSnapshot
 from .detection_support import (
+    MAX_PATTERN_POSTS,
     _AUTHENTIC_RE,
     _COMMERCIAL_RE,
     _CONTACT_RE,
@@ -146,12 +147,13 @@ class DetectionBehaviorMixin:
         return _clamp(statistics.fmean(similarities)) if similarities else 0.0
 
     def _lexical_variation(self, texts: list[str]) -> float:
-        if not texts:
+        bounded = texts[: min(40, MAX_PATTERN_POSTS)]
+        if not bounded:
             return 0.0
-        if len(texts) == 1:
-            tokens = _tokens(texts[0])
+        if len(bounded) == 1:
+            tokens = _tokens(bounded[0])
             return len(set(tokens)) / max(1, len(tokens))
-        token_sets = [set(_tokens(text)) for text in texts]
+        token_sets = [set(_tokens(text)) for text in bounded]
         similarities = [
             len(first & second) / max(1, len(first | second))
             for first, second in combinations(token_sets, 2)
@@ -161,13 +163,22 @@ class DetectionBehaviorMixin:
 
     def _cadence_burst(self, posts: list[PostSnapshot]) -> float:
         times: list[datetime] = []
-        for post in posts:
+        for post in posts[:MAX_PATTERN_POSTS]:
             if not post.published_at:
                 continue
             try:
-                times.append(datetime.fromisoformat(post.published_at.replace("Z", "+00:00")))
+                parsed = datetime.fromisoformat(post.published_at.replace("Z", "+00:00"))
             except ValueError:
                 continue
+            # Imported datasets often mix `2026-08-01T12:00:00` and explicit
+            # offset timestamps. Python refuses to sort naive and aware datetimes;
+            # treating naive import timestamps as UTC keeps cadence deterministic
+            # instead of crashing a whole investigation.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            times.append(parsed)
         if len(times) < 3:
             return 0.0
         times.sort()
@@ -185,7 +196,7 @@ class DetectionBehaviorMixin:
         return 1.0 / (1.0 + cv)
 
     def _engagement_pattern(self, posts: list[PostSnapshot]) -> float:
-        with_views = [post for post in posts if post.views > 0]
+        with_views = [post for post in posts[:MAX_PATTERN_POSTS] if post.views > 0]
         if len(with_views) < 2:
             return 0.0
         ratios = [
