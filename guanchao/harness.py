@@ -141,7 +141,6 @@ class AgentHarness:
             db_active = self.store.active_run_for_case(case_id)
             if db_active:
                 raise ActiveRunError(db_active["id"])
-            self.store.add_message(case_id, "user", message)
             assets = self.store.list_assets(case_id, include_text=True)
             state: dict[str, Any] = {
                 "goal": message or case["goal"],
@@ -158,12 +157,16 @@ class AgentHarness:
                 "trajectory": [],
             }
             try:
-                run = self.store.create_run(case_id, state, actor=actor)
+                # User message, running row and run_started audit event are one
+                # SQLite transaction. If the DB-level single-running invariant
+                # rejects this claim, no ghost chat message or orphan run survives.
+                run = self.store.create_run(
+                    case_id,
+                    state,
+                    actor=actor,
+                    user_message=message,
+                )
             except sqlite3.IntegrityError:
-                # The partial unique index is the last line of defence on systems
-                # where cross-process flock is unavailable or bypassed. Translate
-                # its expected collision into the same product-level conflict as
-                # the optimistic active-run check rather than leaking a 500.
                 active = self.store.active_run_for_case(case_id)
                 if active:
                     raise ActiveRunError(active["id"]) from None
