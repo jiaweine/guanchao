@@ -222,7 +222,7 @@ def test_duplicate_review_retry_is_learning_noop_and_uncertain_withdraws_feedbac
     assert client.post("/api/reviews", json=payload).status_code == 200
     app.state.harness.wait_learning(10)
     first = app.state.store.get_policy_profile()
-    assert run_id in first.review_feedback
+    assert case["id"] in first.review_feedback
     first_reviews = first.reviews
     first_fingerprint = first.review_dataset_fingerprint
 
@@ -248,6 +248,6 @@ def test_duplicate_review_retry_is_learning_noop_and_uncertain_withdraws_feedbac
     ).status_code == 200
     app.state.harness.wait_learning(10)
     withdrawn = app.state.store.get_policy_profile()
-    assert run_id not in withdrawn.review_feedback
+    assert case["id"] not in withdrawn.review_feedback
     assert withdrawn.reviews == max(0, first_reviews - 1)
-    assert app.state.store.labeled_examples() == []
+    assert app.state.harness.review_examples() == []
