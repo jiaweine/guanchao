@@ -21,6 +21,14 @@ IDEMPOTENCY_TTL_SECONDS = 600.0
 IDEMPOTENCY_CACHE_LIMIT = 256
 
 
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
 def _case_id_from_path(path: str) -> str | None:
     parts = [part for part in path.split('/') if part]
     if len(parts) < 3 or parts[0] != 'api' or parts[1] != 'cases' or parts[2] == 'batch':
@@ -106,7 +114,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     idempotency_inflight: dict[
         str, tuple[str, asyncio.Future[tuple[int, dict[str, str], bytes] | None]]
     ] = {}
-    perception_slots = asyncio.Semaphore(max(1, int(os.getenv('GUANCHAO_PERCEPTION_WORKERS', '4'))))
+    perception_slots = asyncio.Semaphore(
+        _env_int('GUANCHAO_PERCEPTION_WORKERS', 4, 1, 64)
+    )
 
     def lock_for(case_id: str) -> asyncio.Lock:
         lock = case_locks.get(case_id)
@@ -151,7 +161,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         )
             if owner:
                 break
-            record = await future
+            # All duplicate callers share this future. A disconnected/cancelled
+            # waiter must not cancel the shared synchronization primitive and
+            # poison every other retry waiting on the same idempotency key.
+            record = await asyncio.shield(future)
             if record is not None:
                 return _response_from_record(record)
 
