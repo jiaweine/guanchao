@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -105,15 +106,11 @@ def test_generic_case_claim_cannot_hijack_fresh_unleased_run(tmp_path, monkeypat
             run_id = active["id"]
             assert _lease_row(first_store, run_id) is None
 
-            # A successful non-start mutation claim is the dangerous case: older
-            # code's post-hook would adopt somebody else's fresh unleased run.
             with run_claim(db, case["id"]):
                 observed = second_store.active_run_for_case(case["id"])
                 assert observed is not None and observed["id"] == run_id
             assert _lease_row(first_store, run_id) is None
 
-            # A second start must only report the active run; it must not change
-            # ownership or cause the first creator's later confirmation to fail.
             with pytest.raises(ActiveRunError):
                 second.start(case["id"], "并发第二个 worker")
             assert _lease_row(first_store, run_id) is None
@@ -180,6 +177,56 @@ def test_schema_cache_reinstalls_runtime_schema_after_database_file_replacement(
         ).fetchone()
     finally:
         conn.close()
+    lease_module.shutdown_heartbeats()
+
+
+def test_runtime_schema_migration_blocks_concurrent_writer_until_commit(tmp_path, monkeypatch):
+    db = str(tmp_path / "atomic-schema.sqlite")
+    store = Store(db)
+    case = store.create_case("原子迁移", "核查", [_target("atomic-schema")])
+
+    # Force the path through schema installation instead of a prior test's cache.
+    lease_module._SCHEMA_READY.pop(lease_module._db_key(db), None)
+    migration_entered = Event()
+    release_migration = Event()
+    writer_done = Event()
+    original_ensure = lease_module.ensure_schema
+
+    def blocked_ensure(conn, grace_seconds=None):
+        # _ensure_path_schema acquires BEGIN IMMEDIATE before calling this hook.
+        migration_entered.set()
+        assert release_migration.wait(3), "test did not release runtime migration"
+        return original_ensure(conn, grace_seconds)
+
+    monkeypatch.setattr(lease_module, "ensure_schema", blocked_ensure)
+
+    def install():
+        lease_module.prepare_case_claim(db, case["id"])
+
+    def writer():
+        conn = sqlite3.connect(db, timeout=3)
+        try:
+            conn.execute(
+                "UPDATE cases SET title = ? WHERE id = ?",
+                ("迁移完成后写入", case["id"]),
+            )
+            conn.commit()
+            writer_done.set()
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        install_future = executor.submit(install)
+        assert migration_entered.wait(1), "runtime migration did not enter ensure_schema"
+        writer_future = executor.submit(writer)
+        time.sleep(0.15)
+        assert not writer_done.is_set(), "writer crossed a partially-installed runtime schema"
+        release_migration.set()
+        install_future.result(timeout=3)
+        writer_future.result(timeout=3)
+
+    assert writer_done.is_set()
+    assert store.get_case(case["id"])["title"] == "迁移完成后写入"
     lease_module.shutdown_heartbeats()
 
 
