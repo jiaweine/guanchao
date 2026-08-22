@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import threading
@@ -103,6 +104,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     store = Store(db_path or os.getenv("GUANCHAO_DB", "guanchao.db"))
     harness = AgentHarness(store)
     perception = PerceptionGateway()
+    perception_slots = threading.BoundedSemaphore(
+        _env_int("GUANCHAO_PERCEPTION_WORKERS", 2, 1, 64)
+    )
     store.purge_retention(actor="system")
     app = FastAPI(title="Guanchao", docs_url="/docs", redoc_url=None)
     app.state.store = store
@@ -176,9 +180,38 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if len(parts) < 3 or parts[0] != "api" or parts[1] != "cases":
             return None
         candidate = parts[2]
-        if candidate in {"batch"}:
+        if candidate == "batch":
             return None
         return candidate[:64]
+
+    def extract_with_capacity(storage_path: str, kind: str, content_type: str) -> tuple[str, str]:
+        # Use the event loop's worker pool only as transport. The explicit
+        # semaphore is the product-level capacity limit and remains held even if
+        # the HTTP coroutine is cancelled while perception is still executing.
+        with perception_slots:
+            return perception.extract(storage_path, kind, content_type)
+
+    async def await_perception_settlement(
+        storage_path: str,
+        kind: str,
+        content_type: str,
+    ) -> tuple[tuple[str, str] | None, BaseException | None, asyncio.CancelledError | None]:
+        task = asyncio.create_task(
+            asyncio.to_thread(extract_with_capacity, storage_path, kind, content_type)
+        )
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                return result, None, cancelled
+            except asyncio.CancelledError as exc:
+                # Cancellation is remembered but not propagated until the worker
+                # finishes and the asset row is settled under the same case claim.
+                if cancelled is None:
+                    cancelled = exc
+                continue
+            except BaseException as exc:
+                return None, exc, cancelled
 
     @app.middleware("http")
     async def protect_case_mutations(request: Request, call_next: Any) -> Response:
@@ -459,8 +492,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             Path(storage_path).unlink(missing_ok=True)
             raise
 
-        try:
-            extracted, asset_status = perception.extract(storage_path, kind, content_type)
+        perception_result, perception_error, cancelled = await await_perception_settlement(
+            storage_path, kind, content_type
+        )
+        if perception_error is None and perception_result is not None:
+            extracted, asset_status = perception_result
             note = (
                 "已读取"
                 if asset_status == "ready"
@@ -475,14 +511,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 note=note,
                 error="" if asset_status != "error" else "perception_failed",
             )
-        except Exception:
+        else:
             store.update_asset(
                 asset.id,
                 "error",
                 note="解析失败，可重新上传或检查本地感知服务",
                 error="perception_failed",
             )
-        return store.get_asset(asset.id, include_text=False)
+        settled = store.get_asset(asset.id, include_text=False)
+        if cancelled is not None:
+            raise cancelled
+        return settled
 
     @app.delete("/api/cases/{case_id}/assets/{asset_id}")
     def delete_asset(case_id: str, asset_id: str, request: Request) -> dict[str, bool]:
