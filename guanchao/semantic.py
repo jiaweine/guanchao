@@ -5,7 +5,9 @@ import json
 import os
 import re
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
+
 import httpx
 
 from .domain import AccountSnapshot
@@ -20,6 +22,22 @@ _SIGNAL_KEYS = {
     "authentic_variation",
     "identity_consistency",
 }
+
+
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
 
 
 @dataclass(slots=True)
@@ -44,8 +62,9 @@ class SemanticEvidenceGateway:
     def __init__(self) -> None:
         self.endpoint = os.getenv("GUANCHAO_SEMANTIC_ENDPOINT", "").rstrip("/")
         self.model = os.getenv("GUANCHAO_SEMANTIC_MODEL", "Qwen/Qwen3.6-35B-A3B")
-        self.timeout = float(os.getenv("GUANCHAO_MODEL_TIMEOUT", "45"))
-        self._cache: dict[str, SemanticSignal] = {}
+        self.timeout = _env_float("GUANCHAO_MODEL_TIMEOUT", 45.0, 0.25, 300.0)
+        self._cache_limit = _env_int("GUANCHAO_SEMANTIC_CACHE", 256, 16, 4096)
+        self._cache: OrderedDict[str, SemanticSignal] = OrderedDict()
         self._lock = threading.RLock()
 
     @property
@@ -58,14 +77,18 @@ class SemanticEvidenceGateway:
         key = self._fingerprint(account, media_text)
         with self._lock:
             cached = self._cache.get(key)
-        if cached is not None:
-            return cached
+            if cached is not None:
+                self._cache.move_to_end(key)
+                return cached
         try:
             signal = self._request(account, media_text)
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             signal = SemanticSignal()
         with self._lock:
             self._cache[key] = signal
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_limit:
+                self._cache.popitem(last=False)
         return signal
 
     def _request(self, account: AccountSnapshot, media_text: str) -> SemanticSignal:
@@ -107,11 +130,15 @@ class SemanticEvidenceGateway:
                 score = max(0.0, min(1.0, float(item.get("score") or 0.0)))
             except (TypeError, ValueError):
                 continue
-            quotes = [str(q).strip() for q in (item.get("quotes") or []) if str(q).strip()]
+            quotes_raw = item.get("quotes") or []
+            if not isinstance(quotes_raw, list):
+                continue
+            quotes = [str(q).strip()[:1000] for q in quotes_raw if str(q).strip()]
             if score <= 0.0:
                 continue
             proposed += 1
-            valid = [q for q in quotes[:3] if _normalize(q) and _normalize(q) in _normalize(corpus)]
+            normalized_corpus = _normalize(corpus)
+            valid = [q for q in quotes[:3] if _normalize(q) and _normalize(q) in normalized_corpus]
             if not valid:
                 continue
             grounded += 1
@@ -141,7 +168,7 @@ class SemanticEvidenceGateway:
 
     @staticmethod
     def _fingerprint(account: AccountSnapshot, media_text: str) -> str:
-        corpus = [account.platform, account.handle, account.bio, media_text]
+        corpus = [account.platform, account.handle, account.bio, media_text[:30000]]
         corpus.extend(f"{p.id}:{p.text}" for p in account.posts[:40])
         return hashlib.sha256("\u241e".join(corpus).encode("utf-8")).hexdigest()
 
