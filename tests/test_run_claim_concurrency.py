@@ -1,13 +1,17 @@
 import asyncio
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from guanchao.api import create_app
 from guanchao.harness import ActiveRunError, AgentHarness
+from guanchao.run_lease import ensure_schema, shutdown_heartbeats, worker_id
+from guanchao.run_lock import run_claim
 from guanchao.store import Store
 
 
@@ -279,3 +283,120 @@ def test_learning_read_modify_write_is_serialized_across_harnesses(tmp_path, mon
         release_first.set()
         first.close()
         second.close()
+
+
+def test_expired_worker_lease_is_reclaimed_and_terminal_run_cannot_resurrect(tmp_path, monkeypatch):
+    db = str(tmp_path / "lease-reclaim.sqlite")
+    store = Store(db)
+    case = store.create_case("崩溃恢复", "核查", [_target()])
+    stale = store.create_run(case["id"], {"goal": "旧 worker", "targets": [_target()]})
+
+    conn = store._connect()
+    try:
+        ensure_schema(conn, grace_seconds=30)
+        conn.execute(
+            "UPDATE run_leases SET worker_id = 'dead-worker', lease_until = ? WHERE run_id = ?",
+            ("2000-01-01T00:00:00+00:00", stale["id"]),
+        )
+        conn.commit()
+    finally:
+        store._close(conn)
+
+    harness = AgentHarness(store)
+    release = Event()
+    monkeypatch.setattr(harness, "_execute", lambda run_id: release.wait(2))
+    try:
+        replacement = harness.start(case["id"], "接管旧任务")
+        assert replacement != stale["id"]
+        assert store.get_run(stale["id"])["status"] == "failed"
+        assert store.active_run_for_case(case["id"])["id"] == replacement
+        assert any(
+            event["event_type"] == "run_lease_expired" and event["run_id"] == stale["id"]
+            for event in store.audit_events(case_id=case["id"], limit=100)
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.update_run(stale["id"], {"goal": "旧 worker 试图复活"}, "running")
+        assert store.get_run(stale["id"])["status"] == "failed"
+    finally:
+        active = store.active_run_for_case(case["id"])
+        if active:
+            store.update_run(active["id"], active["state"], "failed")
+        release.set()
+        harness.close()
+        shutdown_heartbeats()
+
+
+def test_live_foreign_worker_lease_is_not_reclaimed(tmp_path):
+    db = str(tmp_path / "lease-live.sqlite")
+    store = Store(db)
+    case = store.create_case("活租约", "核查", [_target()])
+    run = store.create_run(case["id"], {"goal": "仍活着", "targets": [_target()]})
+
+    conn = store._connect()
+    try:
+        ensure_schema(conn, grace_seconds=30)
+        conn.execute(
+            "UPDATE run_leases SET worker_id = 'other-live-worker', lease_until = ? WHERE run_id = ?",
+            ("2099-01-01T00:00:00+00:00", run["id"]),
+        )
+        conn.commit()
+    finally:
+        store._close(conn)
+
+    with run_claim(db, case["id"]):
+        active = store.active_run_for_case(case["id"])
+        assert active is not None and active["id"] == run["id"]
+
+    conn = store._connect()
+    try:
+        lease = conn.execute(
+            "SELECT worker_id FROM run_leases WHERE run_id = ?", (run["id"],)
+        ).fetchone()
+        assert lease is not None and lease["worker_id"] == "other-live-worker"
+    finally:
+        store._close(conn)
+    store.update_run(run["id"], run["state"], "failed")
+    shutdown_heartbeats()
+
+
+def test_harness_claim_installs_owned_lease_and_heartbeat_renews_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("GUANCHAO_RUN_LEASE_SECONDS", "5")
+    db = str(tmp_path / "lease-heartbeat.sqlite")
+    store = Store(db)
+    case = store.create_case("心跳续租", "核查", [_target()])
+    harness = AgentHarness(store)
+    release = Event()
+    monkeypatch.setattr(harness, "_execute", lambda run_id: release.wait(4))
+
+    try:
+        run_id = harness.start(case["id"], "保持运行")
+        conn = store._connect()
+        try:
+            first = conn.execute(
+                "SELECT worker_id, lease_until FROM run_leases WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            assert first is not None
+            assert first["worker_id"] == worker_id()
+            first_deadline = first["lease_until"]
+        finally:
+            store._close(conn)
+
+        time.sleep(2.1)
+        conn = store._connect()
+        try:
+            second = conn.execute(
+                "SELECT worker_id, lease_until FROM run_leases WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            assert second is not None
+            assert second["worker_id"] == worker_id()
+            assert second["lease_until"] > first_deadline
+        finally:
+            store._close(conn)
+    finally:
+        active = store.active_run_for_case(case["id"])
+        if active:
+            store.update_run(active["id"], active["state"], "failed")
+        release.set()
+        harness.close()
+        shutdown_heartbeats()
