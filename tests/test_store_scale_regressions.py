@@ -1,9 +1,11 @@
 import json
+import sqlite3
 
 from fastapi.testclient import TestClient
 
 from guanchao.api import create_app
 from guanchao.domain import FeatureVector
+from guanchao.harness import AgentHarness
 from guanchao.store import Store
 
 
@@ -16,7 +18,8 @@ def _target(handle: str) -> dict:
     }
 
 
-def _reviewable_state(label: str = "更像普通创作者") -> dict:
+def _reviewable_state(label: str = "更像普通创作者", marker: float = 0.0) -> dict:
+    features = FeatureVector(commercial_language=marker).asdict()
     return {
         "goal": "核查",
         "targets": [_target("reviewable")],
@@ -28,9 +31,18 @@ def _reviewable_state(label: str = "更像普通创作者") -> dict:
             "confidence": 0.8,
             "stability": 0.9,
             "missing": [],
-            "features": FeatureVector().asdict(),
+            "features": features,
         },
-        "trajectory": [],
+        "trajectory": [
+            {
+                "action": "verdict.compose",
+                "features": [1.0, marker, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, marker],
+                "alternative": "evidence.challenge",
+                "alternative_features": [0.0] * 11,
+                "reward": 0.5,
+                "duration_ms": 1.0,
+            }
+        ],
     }
 
 
@@ -151,8 +163,6 @@ def test_metrics_use_constant_connection_count_instead_of_per_review_n_plus_one(
     metrics = store.product_metrics()
     assert metrics["reviewed"] == 25
     assert metrics["acceptance_rate"] == 1.0
-    # One Store connection should be enough for the batched metrics query set.
-    # Keep a little slack so a future harmless health query does not make this brittle.
     assert calls <= 2
 
 
@@ -184,3 +194,84 @@ def test_verified_last_7_days_excludes_uncertain_reviews(tmp_path):
     assert metrics["reviewed"] == 2
     assert metrics["uncertain_rate"] == 0.5
     assert metrics["verified_last_7_days"] == 1
+
+
+def test_store_upgrade_repairs_duplicate_running_rows_and_enforces_unique_invariant(tmp_path):
+    db = str(tmp_path / "legacy-running.sqlite")
+    store = Store(db)
+    case = store.create_case("旧库重复运行", "核查", [_target("legacy")])
+
+    conn = store._connect()
+    try:
+        conn.execute("DROP INDEX idx_runs_one_running_case")
+        state_json = json.dumps(_reviewable_state(), ensure_ascii=False)
+        conn.execute(
+            "INSERT INTO runs VALUES (?, ?, 'running', ?, ?, ?)",
+            ("legacy-run-a", case["id"], state_json, "2026-08-22T10:00:00+00:00", "2026-08-22T10:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO runs VALUES (?, ?, 'running', ?, ?, ?)",
+            ("legacy-run-b", case["id"], state_json, "2026-08-22T10:01:00+00:00", "2026-08-22T10:01:00+00:00"),
+        )
+        conn.commit()
+    finally:
+        store._close(conn)
+
+    upgraded = Store(db)
+    conn = upgraded._connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, status FROM runs WHERE case_id = ? ORDER BY id",
+            (case["id"],),
+        ).fetchall()
+        assert sum(row["status"] == "running" for row in rows) == 1
+        assert next(row for row in rows if row["status"] == "running")["id"] == "legacy-run-b"
+        recovered = upgraded.audit_events(case_id=case["id"], limit=20)
+        assert any(
+            item["event_type"] == "run_duplicate_recovered"
+            and item["run_id"] == "legacy-run-a"
+            for item in recovered
+        )
+        with sqlite3.connect(db) as raw:
+            with __import__("pytest").raises(sqlite3.IntegrityError):
+                raw.execute(
+                    "INSERT INTO runs VALUES (?, ?, 'running', ?, ?, ?)",
+                    ("legacy-run-c", case["id"], state_json, "2026-08-22T10:02:00+00:00", "2026-08-22T10:02:00+00:00"),
+                )
+    finally:
+        upgraded._close(conn)
+
+
+def test_latest_review_learning_snapshot_is_case_level_and_has_no_get_run_n_plus_one(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "latest-review.sqlite"))
+    case = store.create_case("复核覆盖", "核查", [_target("latest")])
+
+    first_state = _reviewable_state("更像普通创作者", marker=0.1)
+    first_run = store.create_run(case["id"], first_state)
+    store.update_run(first_run["id"], first_state, "completed")
+    store.add_review(case["id"], first_run["id"], "confirm_ordinary")
+
+    second_state = _reviewable_state("高度营销化", marker=0.9)
+    second_run = store.create_run(case["id"], second_state)
+    store.update_run(second_run["id"], second_state, "completed")
+    store.add_review(case["id"], second_run["id"], "confirm_marketing")
+
+    snapshots = store.latest_review_snapshots()
+    assert len(snapshots) == 1
+    assert snapshots[0]["run_id"] == second_run["id"]
+    assert snapshots[0]["run_state"]["primary_result"]["features"]["commercial_language"] == 0.9
+
+    harness = AgentHarness(store)
+    monkeypatch.setattr(
+        store,
+        "get_run",
+        lambda run_id: (_ for _ in ()).throw(AssertionError("learning fell back to per-case get_run")),
+    )
+    try:
+        latest = harness._latest_reviews_by_case()
+        examples = harness.review_examples(latest)
+        assert len(examples) == 1
+        assert examples[0].label == 1
+        assert examples[0].features.commercial_language == 0.9
+    finally:
+        harness.close()
