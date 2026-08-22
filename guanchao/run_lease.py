@@ -157,9 +157,6 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
         (configured_global_inflight(), now),
     )
 
-    # Only the connection that actually creates the lease table may migrate
-    # pre-existing running rows. A later worker must not label a run that another
-    # new-code worker has just inserted but has not yet adopted in its post-hook.
     if not lease_table_existed:
         deadline = _deadline(grace_seconds or legacy_grace_seconds())
         conn.execute(
@@ -334,9 +331,6 @@ def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
             continue
         created = _parse(row["created_at"])
         if created is not None and created <= missing_cutoff:
-            # Once the lease table already exists, an unleased run older than the
-            # create/adopt window represents a crashed new-code worker. Give it an
-            # already-expired legacy marker so active_or_reclaim can CAS-fail it.
             conn.execute(
                 "INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until) "
                 "SELECT id, 'orphaned-worker', ? FROM runs "
@@ -398,15 +392,24 @@ class _HeartbeatRegistry:
         self._stop = threading.Event()
         self._thread = None
 
+    @staticmethod
+    def _normal_interval(seconds: int) -> float:
+        return max(1.0, min(30.0, seconds / 3.0))
+
+    @staticmethod
+    def _retry_interval(seconds: int) -> float:
+        # Retry fast enough that one transient SQLite lock cannot consume the
+        # whole remaining lease window, but avoid a busy loop during an outage.
+        return max(0.25, min(2.0, seconds / 10.0))
+
     def register(self, db_path: str, run_id: str, seconds: int) -> None:
         with self._guard:
             self._ensure_process()
-            interval = max(1.0, min(30.0, seconds / 3.0))
             self._items[(_db_key(db_path), run_id)] = _Registration(
                 db_path=db_path,
                 run_id=run_id,
                 seconds=seconds,
-                next_renew_at=time.monotonic() + interval,
+                next_renew_at=time.monotonic() + self._normal_interval(seconds),
             )
             if self._thread is None or not self._thread.is_alive():
                 self._stop.clear()
@@ -430,15 +433,35 @@ class _HeartbeatRegistry:
                 self._ensure_process()
                 due = [item for item in self._items.values() if item.next_renew_at <= now]
             for item in due:
-                self._renew(item)
+                try:
+                    self._renew(item)
+                except Exception:
+                    # The daemon must survive one unexpected renewal bug. Keep the
+                    # registration and retry rather than silently losing liveness.
+                    self._reschedule(item, retry=True)
             self._wake.wait(0.25)
             self._wake.clear()
+
+    def _reschedule(self, item: _Registration, *, retry: bool) -> None:
+        with self._guard:
+            key = (_db_key(item.db_path), item.run_id)
+            current = self._items.get(key)
+            if current is not item:
+                return
+            interval = (
+                self._retry_interval(item.seconds)
+                if retry
+                else self._normal_interval(item.seconds)
+            )
+            current.next_renew_at = time.monotonic() + interval
 
     def _renew(self, item: _Registration) -> None:
         owner = worker_id()
         keep = False
-        conn = _connect(item.db_path)
+        retry = False
+        conn: sqlite3.Connection | None = None
         try:
+            conn = _connect(item.db_path)
             row = conn.execute(
                 """
                 SELECT r.status, l.worker_id
@@ -457,13 +480,22 @@ class _HeartbeatRegistry:
                     (item.run_id, owner),
                 )
                 conn.commit()
-        except (sqlite3.Error, RunLeaseLostError):
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                pass
+        except RunLeaseLostError:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+        except sqlite3.Error:
+            retry = True
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
         with self._guard:
             key = (_db_key(item.db_path), item.run_id)
@@ -471,8 +503,9 @@ class _HeartbeatRegistry:
             if current is not item:
                 return
             if keep:
-                interval = max(1.0, min(30.0, item.seconds / 3.0))
-                current.next_renew_at = time.monotonic() + interval
+                current.next_renew_at = time.monotonic() + self._normal_interval(item.seconds)
+            elif retry:
+                current.next_renew_at = time.monotonic() + self._retry_interval(item.seconds)
             else:
                 self._items.pop(key, None)
 
