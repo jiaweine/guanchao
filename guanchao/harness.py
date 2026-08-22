@@ -21,6 +21,7 @@ from .tools import ToolRegistry
 from .verifier import ResultVerifier
 
 _LEARNING_CLAIM = "__guanchao_learning_state__"
+_CALIBRATION_PROVENANCE_KEY = "review_calibration_provenance"
 
 
 class ActiveRunError(RuntimeError):
@@ -104,8 +105,6 @@ class AgentHarness:
                 self._ensure_open()
                 for case_id in case_ids:
                     run_id = self._prepare_run(case_id, message, actor)
-                    # Append before confirmation so any adoption failure has a
-                    # durable run_id that the shared cleanup path can fail safely.
                     prepared.append((case_id, run_id))
                     self._confirm_run_lease(case_id, run_id)
                 for _, run_id in prepared:
@@ -456,7 +455,7 @@ class AgentHarness:
 
             if dataset_changed:
                 report, calibration_promoted, calibration_reset = self._fit_review_dataset(
-                    examples, profile
+                    examples, profile, fingerprint
                 )
                 report_examples = report.examples
                 profile.review_dataset_fingerprint = fingerprint
@@ -498,8 +497,9 @@ class AgentHarness:
             profile = self.store.get_policy_profile()
             self._sync_review_feedback(profile, latest)
             examples = self.review_examples(latest)
-            report, _, _ = self._fit_review_dataset(examples, profile)
-            profile.review_dataset_fingerprint = self._review_dataset_fingerprint(examples)
+            fingerprint = self._review_dataset_fingerprint(examples)
+            report, _, _ = self._fit_review_dataset(examples, profile, fingerprint)
+            profile.review_dataset_fingerprint = fingerprint
             self.store.save_policy_profile(profile)
             return report
 
@@ -507,16 +507,46 @@ class AgentHarness:
         self,
         examples: list[LabeledExample],
         profile: Any,
+        fingerprint: str,
     ) -> tuple[EvolutionReport, bool, bool]:
-        baseline = Calibration()
         current = self.store.get_calibration()
-        report = EvolutionEngine().evolve(baseline, examples, profile)
+        provenance = self.store._setting(_CALIBRATION_PROVENANCE_KEY) or {}
+        base = current
+        managed = False
+        if isinstance(provenance, dict):
+            raw_base = provenance.get("base")
+            raw_applied = provenance.get("applied")
+            if isinstance(raw_base, dict) and isinstance(raw_applied, dict):
+                applied = Calibration.from_dict(raw_applied)
+                if current == applied:
+                    base = Calibration.from_dict(raw_base)
+                    managed = True
+
+        # Rebuild review-owned calibration from its pre-review base, not from the
+        # previous review fit. This keeps edited/withdrawn labels reversible and
+        # prevents stale supervision from being regularized back into the model.
+        # If current no longer matches the last applied review calibration, an
+        # external/manual override happened; that current value becomes the new
+        # base and is never reset to the cold-start default by review learning.
+        report = EvolutionEngine().evolve(base, examples, profile)
         if report.accepted:
             self.store.save_calibration(report.calibration)
+            self.store._save_setting(
+                _CALIBRATION_PROVENANCE_KEY,
+                {
+                    "base": base.to_dict(),
+                    "applied": report.calibration.to_dict(),
+                    "dataset_fingerprint": fingerprint,
+                },
+            )
             return report, True, False
-        reset = current != baseline
+
+        reset = managed and current != base
         if reset:
-            self.store.save_calibration(baseline)
+            self.store.save_calibration(base)
+        # A rejected/insufficient review dataset owns no calibration overlay. The
+        # base remains untouched and a future decisive dataset will start from it.
+        self.store._save_setting(_CALIBRATION_PROVENANCE_KEY, {})
         return report, False, reset
 
     def _latest_reviews_by_case(self) -> dict[str, dict[str, Any]]:
