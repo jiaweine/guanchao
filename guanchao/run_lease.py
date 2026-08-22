@@ -102,6 +102,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) -> None:
     """Install run ownership, global capacity, and terminal-state invariants."""
+    lease_table_existed = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_leases'"
+    ).fetchone() is not None
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS run_leases (
@@ -153,14 +156,19 @@ def ensure_schema(conn: sqlite3.Connection, grace_seconds: int | None = None) ->
         """,
         (configured_global_inflight(), now),
     )
-    deadline = _deadline(grace_seconds or legacy_grace_seconds())
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until)
-        SELECT id, 'legacy-worker', ? FROM runs WHERE status = 'running'
-        """,
-        (deadline,),
-    )
+
+    # Only the connection that actually creates the lease table may migrate
+    # pre-existing running rows. A later worker must not label a run that another
+    # new-code worker has just inserted but has not yet adopted in its post-hook.
+    if not lease_table_existed:
+        deadline = _deadline(grace_seconds or legacy_grace_seconds())
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until)
+            SELECT id, 'legacy-worker', ? FROM runs WHERE status = 'running'
+            """,
+            (deadline,),
+        )
     conn.execute(
         "DELETE FROM run_leases WHERE run_id IN (SELECT id FROM runs WHERE status != 'running')"
     )
@@ -308,18 +316,35 @@ def active_or_reclaim(
 def reclaim_expired_runs(conn: sqlite3.Connection, now_iso: str) -> int:
     """Sweep crashed owners globally so stale cases do not consume capacity."""
     now = _parse(now_iso) or _utcnow()
+    missing_cutoff = now - timedelta(seconds=30)
     rows = conn.execute(
         """
-        SELECT DISTINCT r.case_id, l.lease_until
-        FROM runs r JOIN run_leases l ON l.run_id = r.id
+        SELECT DISTINCT r.case_id, r.created_at, l.lease_until
+        FROM runs r LEFT JOIN run_leases l ON l.run_id = r.id
         WHERE r.status = 'running'
         """
     ).fetchall()
-    candidates = {
-        str(row["case_id"])
-        for row in rows
-        if (_parse(row["lease_until"]) is None or _parse(row["lease_until"]) <= now)
-    }
+    candidates: set[str] = set()
+    for row in rows:
+        case_id = str(row["case_id"])
+        deadline = _parse(row["lease_until"])
+        if row["lease_until"] is not None:
+            if deadline is None or deadline <= now:
+                candidates.add(case_id)
+            continue
+        created = _parse(row["created_at"])
+        if created is not None and created <= missing_cutoff:
+            # Once the lease table already exists, an unleased run older than the
+            # create/adopt window represents a crashed new-code worker. Give it an
+            # already-expired legacy marker so active_or_reclaim can CAS-fail it.
+            conn.execute(
+                "INSERT OR IGNORE INTO run_leases(run_id, worker_id, lease_until) "
+                "SELECT id, 'orphaned-worker', ? FROM runs "
+                "WHERE case_id = ? AND status = 'running' AND id NOT IN (SELECT run_id FROM run_leases)",
+                (now_iso, case_id),
+            )
+            candidates.add(case_id)
+
     reclaimed = 0
     for case_id in candidates:
         _, changed = active_or_reclaim(conn, case_id, now_iso)
