@@ -12,6 +12,14 @@ from .domain import FeatureVector
 from .policy import PolicyProfile
 
 
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
 @dataclass(slots=True)
 class LabeledExample:
     features: FeatureVector
@@ -56,7 +64,7 @@ class EvolutionEngine:
         counts = {label: sum(item.label == label for item in examples) for label in (0, 1)}
         if min(counts.values(), default=0) < 2:
             return self._reject(current, policy, examples, "复核样本尚不足以形成双类交叉回放")
-        max_folds = max(2, int(os.getenv("GUANCHAO_EVOLUTION_MAX_FOLDS", "5")))
+        max_folds = _env_int("GUANCHAO_EVOLUTION_MAX_FOLDS", 5, 2, 20)
         k = max(2, min(max_folds, min(counts.values()), int(math.sqrt(len(examples))) or 2))
         folds = self._folds(examples, k)
         baselines: list[float] = []
@@ -113,15 +121,43 @@ class EvolutionEngine:
 
     @staticmethod
     def _folds(examples: list[LabeledExample], k: int) -> list[list[LabeledExample]]:
-        folds = [[] for _ in range(k)]
-        by_class: dict[int, list[tuple[str, LabeledExample]]] = {0: [], 1: []}
-        for item in examples:
-            fingerprint = item.group or "|".join(f"{value:.6f}" for value in item.features.asdict().values())
-            digest = hashlib.sha256(f"{item.label}|{fingerprint}".encode()).hexdigest()
-            by_class.setdefault(item.label, []).append((digest, item))
+        """Build deterministic folds without ever splitting a declared group."""
+        folds: list[list[LabeledExample]] = [[] for _ in range(k)]
+        grouped: dict[str, list[LabeledExample]] = {}
+        for index, item in enumerate(examples):
+            feature_key = "|".join(
+                f"{value:.6f}" for value in item.features.asdict().values()
+            )
+            # An empty group means the caller considers this row independent;
+            # include its row index so identical feature vectors are not silently
+            # merged into one group.
+            key = item.group or f"__row__:{index}:{item.label}:{feature_key}"
+            grouped.setdefault(key, []).append(item)
+
+        by_class: dict[int, list[tuple[str, list[LabeledExample]]]] = {0: [], 1: []}
+        for group, rows in grouped.items():
+            label_counts = {
+                label: sum(item.label == label for item in rows)
+                for label in (0, 1)
+            }
+            # Mixed-label groups are unusual but still stay intact. Assign them
+            # to their majority class only for balancing; tie breaks are stable.
+            balance_label = 1 if label_counts[1] > label_counts[0] else 0
+            payload = group + "|" + "|".join(
+                f"{item.label}:" + ",".join(
+                    f"{value:.6f}" for value in item.features.asdict().values()
+                )
+                for item in rows
+            )
+            digest = hashlib.sha256(payload.encode()).hexdigest()
+            by_class.setdefault(balance_label, []).append((digest, rows))
+
+        # Round-robin whole groups within each class. Starting each class at fold
+        # zero keeps per-class counts balanced while the hash makes assignment
+        # deterministic across process restarts.
         for label in sorted(by_class):
-            for index, (_, item) in enumerate(sorted(by_class[label], key=lambda row: row[0])):
-                folds[index % k].append(item)
+            for index, (_, rows) in enumerate(sorted(by_class[label], key=lambda row: row[0])):
+                folds[index % k].extend(rows)
         return folds
 
     def _fit(self, current: Calibration, examples: list[LabeledExample]) -> Calibration:
