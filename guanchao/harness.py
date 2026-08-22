@@ -13,7 +13,11 @@ from .detection import Calibration, MarketingDetector
 from .domain import FeatureVector, RunEvent
 from .evolution import EvolutionEngine, EvolutionReport, LabeledExample
 from .policy import OwnedPolicy
-from .run_lease import is_global_capacity_error, observe_running_case
+from .run_lease import (
+    is_global_capacity_error,
+    observe_running_case,
+    prepare_run_start,
+)
 from .run_lock import run_claim
 from .semantic import SemanticEvidenceGateway
 from .store import Store
@@ -82,6 +86,10 @@ class AgentHarness:
         try:
             with self._guard:
                 self._ensure_open()
+                # Global stale-owner cleanup is needed only when a new running row
+                # may consume shared capacity. Ordinary case mutations now avoid
+                # this workspace-wide sweep entirely.
+                prepare_run_start(self.store.path)
                 run_id = self._prepare_run(case_id, message, actor)
                 self._confirm_run_lease(case_id, run_id)
                 self._submit(run_id)
@@ -103,6 +111,9 @@ class AgentHarness:
         try:
             with self._guard:
                 self._ensure_open()
+                # One sweep is enough for the whole batch. Repeating it once per
+                # case makes large batch creation quadratic in the running set.
+                prepare_run_start(self.store.path)
                 for case_id in case_ids:
                     run_id = self._prepare_run(case_id, message, actor)
                     prepared.append((case_id, run_id))
@@ -522,12 +533,6 @@ class AgentHarness:
                     base = Calibration.from_dict(raw_base)
                     managed = True
 
-        # Rebuild review-owned calibration from its pre-review base, not from the
-        # previous review fit. This keeps edited/withdrawn labels reversible and
-        # prevents stale supervision from being regularized back into the model.
-        # If current no longer matches the last applied review calibration, an
-        # external/manual override happened; that current value becomes the new
-        # base and is never reset to the cold-start default by review learning.
         report = EvolutionEngine().evolve(base, examples, profile)
         if report.accepted:
             self.store.save_calibration(report.calibration)
@@ -544,8 +549,6 @@ class AgentHarness:
         reset = managed and current != base
         if reset:
             self.store.save_calibration(base)
-        # A rejected/insufficient review dataset owns no calibration overlay. The
-        # base remains untouched and a future decisive dataset will start from it.
         self.store._save_setting(_CALIBRATION_PROVENANCE_KEY, {})
         return report, False, reset
 
