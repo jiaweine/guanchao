@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -25,10 +26,36 @@ def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value)
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except ValueError:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _safe_json(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    try:
+        return json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
 
 
 class Store:
@@ -55,9 +82,12 @@ class Store:
             return self._memory_conn
         conn = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode is persistent and is set once in _init(). Reissuing it on
+        # every hot-path read takes a schema lock and becomes surprisingly costly
+        # with many short-lived connections under concurrent API traffic.
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=15000")
         return conn
 
     def _close(self, conn: sqlite3.Connection) -> None:
@@ -73,6 +103,8 @@ class Store:
     def _init(self) -> None:
         with self._lock:
             conn = self._connect()
+            if self.path != ":memory:":
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS cases (
@@ -197,14 +229,18 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_messages_case_created ON messages(case_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_comments_case_created ON comments(case_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_case_created ON runs(case_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_runs_case_status_created ON runs(case_id, status, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_assets_case_created ON assets(case_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_reviews_case_created ON reviews(case_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_reviews_decision ON reviews(decision, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cases_status_updated ON cases(status, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cases_owner_updated ON cases(owner, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_cases_batch_updated ON cases(batch_id, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cases_monitoring ON cases(monitoring_enabled, next_check_at);
                 CREATE INDEX IF NOT EXISTS idx_events_case_created ON events(case_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_open_lookup
+                    ON events(event_type, case_id, run_id, actor, created_at DESC);
                 """
             )
             now = utcnow_iso()
@@ -252,7 +288,7 @@ class Store:
         self._metrics_cache_at = 0.0
 
     def audit_events(self, case_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 500))
+        limit = max(1, min(_safe_int(limit, 100), 500))
         with self._lock:
             conn = self._connect()
             if case_id:
@@ -491,26 +527,69 @@ class Store:
         priority: str = "",
         sort: str = "updated_desc",
         batch_id: str = "",
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status and status != "all":
+            clauses.append("c.status = ?")
+            params.append(status)
+        if owner:
+            clauses.append("c.owner = ?")
+            params.append(owner)
+        if priority:
+            clauses.append("c.priority = ?")
+            params.append(priority)
+        if batch_id:
+            clauses.append("c.batch_id = ?")
+            params.append(batch_id)
+
+        normalized = query.strip().lower()
+        # Coarse SQL predicates reduce the working set while the exact Python
+        # check below preserves the historical semantics (title/goal/handle/name,
+        # not arbitrary bio/post text stored inside targets_json).
+        if normalized:
+            like = f"%{normalized}%"
+            clauses.append(
+                "(lower(c.title) LIKE ? OR lower(c.goal) LIKE ? OR lower(c.targets_json) LIKE ?)"
+            )
+            params.extend((like, like, like))
+        if platform:
+            clauses.append("lower(c.targets_json) LIKE ?")
+            params.append(f"%{platform.strip().lower()}%")
+
+        order_sql = {
+            "updated_asc": "c.updated_at ASC, c.id ASC",
+            "created_desc": "c.created_at DESC, c.id DESC",
+            "updated_desc": "c.updated_at DESC, c.id DESC",
+        }.get(sort, "c.updated_at DESC, c.id DESC")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        sql = f"""
+            SELECT c.*,
+                   r.id AS latest_run_id, r.status AS latest_run_status,
+                   r.state_json AS latest_state_json, r.updated_at AS latest_run_updated_at,
+                   rv.decision AS latest_review_decision
+            FROM cases c
+            LEFT JOIN runs r ON r.id = (
+                SELECT r2.id FROM runs r2 WHERE r2.case_id = c.id
+                ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1
+            )
+            LEFT JOIN reviews rv ON rv.run_id = r.id
+            {where}
+            ORDER BY {order_sql}
+        """
+        requested_limit = None if limit is None else max(1, _safe_int(limit, 1))
+        can_limit_in_sql = requested_limit is not None and not normalized and not platform and sort != "risk_desc"
+        if can_limit_in_sql:
+            sql += " LIMIT ?"
+            params.append(requested_limit)
+
         with self._lock:
             conn = self._connect()
-            rows = conn.execute(
-                """
-                SELECT c.*,
-                       r.id AS latest_run_id, r.status AS latest_run_status,
-                       r.state_json AS latest_state_json, r.updated_at AS latest_run_updated_at,
-                       rv.decision AS latest_review_decision
-                FROM cases c
-                LEFT JOIN runs r ON r.id = (
-                    SELECT r2.id FROM runs r2 WHERE r2.case_id = c.id
-                    ORDER BY r2.created_at DESC LIMIT 1
-                )
-                LEFT JOIN reviews rv ON rv.run_id = r.id
-                """
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             self._close(conn)
         items = [self._case_summary(row) for row in rows]
-        normalized = query.strip().lower()
+
         if normalized:
             items = [
                 item for item in items
@@ -523,23 +602,14 @@ class Store:
                 )
             ]
         if platform:
-            items = [item for item in items if any(t.get("platform") == platform for t in item["targets"])]
-        if status and status != "all":
-            items = [item for item in items if item["status"] == status]
-        if owner:
-            items = [item for item in items if item["owner"] == owner]
-        if priority:
-            items = [item for item in items if item["priority"] == priority]
-        if batch_id:
-            items = [item for item in items if item["batch_id"] == batch_id]
-        if sort == "updated_asc":
-            items.sort(key=lambda item: item["updated_at"])
-        elif sort == "created_desc":
-            items.sort(key=lambda item: item["created_at"], reverse=True)
-        elif sort == "risk_desc":
+            items = [
+                item for item in items
+                if any(str(target.get("platform") or "") == platform for target in item["targets"])
+            ]
+        if sort == "risk_desc":
             items.sort(key=lambda item: item.get("review_priority") or -1, reverse=True)
-        else:
-            items.sort(key=lambda item: item["updated_at"], reverse=True)
+        if requested_limit is not None and not can_limit_in_sql:
+            items = items[:requested_limit]
         return items
 
     def get_case(self, case_id: str) -> dict[str, Any]:
@@ -970,11 +1040,35 @@ class Store:
         owner: str = "",
         priority: str = "",
         sort: str = "priority_desc",
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        clauses = ["c.status = 'open'", "r.status = 'completed'"]
+        params: list[Any] = []
+        if reviewed is True:
+            clauses.append("rv.id IS NOT NULL")
+        elif reviewed is False:
+            clauses.append("rv.id IS NULL")
+        if owner:
+            clauses.append("c.owner = ?")
+            params.append(owner)
+        if priority:
+            clauses.append("c.priority = ?")
+            params.append(priority)
+        normalized = query.strip().lower()
+        if normalized:
+            like = f"%{normalized}%"
+            clauses.append(
+                "(lower(c.title) LIKE ? OR lower(c.goal) LIKE ? OR lower(c.targets_json) LIKE ?)"
+            )
+            params.extend((like, like, like))
+        if platform:
+            clauses.append("lower(c.targets_json) LIKE ?")
+            params.append(f"%{platform.strip().lower()}%")
+
         with self._lock:
             conn = self._connect()
             rows = conn.execute(
-                """
+                f"""
                 SELECT c.*,
                        r.id AS run_id, r.state_json, r.updated_at AS run_updated_at,
                        rv.id AS review_id, rv.decision, rv.reason, rv.note, rv.reviewer,
@@ -982,44 +1076,41 @@ class Store:
                 FROM cases c
                 JOIN runs r ON r.id = (
                     SELECT r2.id FROM runs r2 WHERE r2.case_id = c.id
-                    ORDER BY r2.created_at DESC LIMIT 1
+                    ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1
                 )
                 LEFT JOIN reviews rv ON rv.run_id = r.id
-                WHERE c.status = 'open' AND r.status = 'completed'
-                ORDER BY r.updated_at DESC
-                """
+                WHERE {' AND '.join(clauses)}
+                ORDER BY r.updated_at DESC, r.id DESC
+                """,
+                params,
             ).fetchall()
             self._close(conn)
 
         items: list[dict[str, Any]] = []
-        normalized = query.strip().lower()
         for row in rows:
-            has_review = bool(row["review_id"])
-            if reviewed is True and not has_review:
+            state = _safe_json(row["state_json"], {})
+            if not isinstance(state, dict):
                 continue
-            if reviewed is False and has_review:
-                continue
-            state = json.loads(row["state_json"])
             result = state.get("primary_result") or {}
-            if not result:
+            if not isinstance(result, dict) or not result:
                 continue
-            targets = json.loads(row["targets_json"])
+            targets = _safe_json(row["targets_json"], [])
+            if not isinstance(targets, list):
+                targets = []
             if normalized:
                 haystack = " ".join(
                     [row["title"], row["goal"]]
-                    + [str(t.get("handle") or "") for t in targets]
-                    + [str(t.get("display_name") or "") for t in targets]
+                    + [str(t.get("handle") or "") for t in targets if isinstance(t, dict)]
+                    + [str(t.get("display_name") or "") for t in targets if isinstance(t, dict)]
                 ).lower()
                 if normalized not in haystack:
                     continue
-            if platform and not any(t.get("platform") == platform for t in targets):
-                continue
-            if owner and row["owner"] != owner:
-                continue
-            if priority and row["priority"] != priority:
+            if platform and not any(
+                isinstance(target, dict) and target.get("platform") == platform for target in targets
+            ):
                 continue
             review = None
-            if has_review:
+            if row["review_id"]:
                 review = {
                     "id": row["review_id"],
                     "case_id": row["id"],
@@ -1031,6 +1122,7 @@ class Store:
                     "created_at": row["review_created_at"],
                     "updated_at": row["review_updated_at"],
                 }
+            tags = _safe_json(row["tags_json"], [])
             items.append(
                 {
                     "case_id": row["id"],
@@ -1044,38 +1136,56 @@ class Store:
                     "review": review,
                     "owner": row["owner"],
                     "priority": row["priority"],
-                    "tags": json.loads(row["tags_json"] or "[]"),
+                    "tags": tags if isinstance(tags, list) else [],
                     "batch_id": row["batch_id"],
                     "review_priority": self._review_priority(result, row["priority"]),
                 }
             )
         if sort == "risk_desc":
-            items.sort(key=lambda item: float(item["result"].get("marketing_likelihood") or 0), reverse=True)
+            items.sort(key=lambda item: _safe_float(item["result"].get("marketing_likelihood")), reverse=True)
         elif sort == "newest":
             items.sort(key=lambda item: item["run_updated_at"], reverse=True)
         else:
             items.sort(key=lambda item: item["review_priority"], reverse=True)
+        if limit is not None:
+            items = items[: max(1, _safe_int(limit, 1))]
         return items
 
     def monitoring_queue(self, due_only: bool = True) -> list[dict[str, Any]]:
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                """
+                SELECT c.*,
+                       r.id AS latest_run_id, r.status AS latest_run_status,
+                       r.state_json AS latest_state_json, r.updated_at AS latest_run_updated_at,
+                       rv.decision AS latest_review_decision
+                FROM cases c
+                LEFT JOIN runs r ON r.id = (
+                    SELECT r2.id FROM runs r2 WHERE r2.case_id = c.id
+                    ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1
+                )
+                LEFT JOIN reviews rv ON rv.run_id = r.id
+                WHERE c.status = 'open' AND c.monitoring_enabled = 1
+                ORDER BY c.next_check_at, c.id
+                """
+            ).fetchall()
+            self._close(conn)
         now = datetime.now(timezone.utc)
-        items = []
-        for case in self.list_cases(status="open"):
-            if not case["monitoring_enabled"]:
-                continue
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            case = self._case_summary(row)
             next_check = _parse_time(case.get("next_check_at"))
             due = next_check is None or next_check <= now
             if due_only and not due:
                 continue
             items.append({**case, "monitoring_due": due})
-        items.sort(key=lambda item: item.get("next_check_at") or "")
         return items
 
     def workspace_settings(self) -> dict[str, Any]:
         raw = self._setting("workspace") or {}
-        return {
-            "retention_days": max(0, int(raw.get("retention_days") or 0)),
-        }
+        days = _safe_int(raw.get("retention_days"), 0) if isinstance(raw, dict) else 0
+        return {"retention_days": max(0, min(3650, days))}
 
     def save_workspace_settings(self, retention_days: int, actor: str = "local") -> dict[str, Any]:
         retention_days = int(retention_days)
@@ -1114,23 +1224,89 @@ class Store:
             return result
 
     def _compute_product_metrics(self) -> dict[str, Any]:
-        cases = self.list_cases(status="all")
-        queue = self.review_queue(reviewed=False)
-        reviews = self.review_rows()
-        decisive = [row for row in reviews if row["decision"] != "uncertain"]
+        # Keep this path O(queries + reviews), not O(cases + reviews * queries).
+        # The old implementation materialized every case and then issued get_run
+        # and event lookups one review at a time, which becomes the dominant cost
+        # on workspaces with thousands of historical investigations.
+        with self._lock:
+            conn = self._connect()
+            case_counts = conn.execute(
+                """
+                SELECT COUNT(*) AS cases,
+                       SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_cases,
+                       SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) AS archived_cases
+                FROM cases
+                """
+            ).fetchone()
+            monitoring_rows = conn.execute(
+                "SELECT next_check_at FROM cases WHERE status = 'open' AND monitoring_enabled = 1"
+            ).fetchall()
+            review_rows = conn.execute(
+                """
+                SELECT rv.*, r.state_json, r.updated_at AS run_updated_at,
+                       (
+                           SELECT e.created_at FROM events e
+                           WHERE e.event_type = 'case_opened'
+                             AND e.case_id = rv.case_id
+                             AND e.run_id = rv.run_id
+                             AND e.actor = rv.reviewer
+                             AND e.created_at <= rv.updated_at
+                           ORDER BY e.created_at DESC LIMIT 1
+                       ) AS opened_at
+                FROM reviews rv
+                LEFT JOIN runs r ON r.id = rv.run_id
+                ORDER BY rv.created_at
+                """
+            ).fetchall()
+            pending_rows = conn.execute(
+                """
+                SELECT r.state_json
+                FROM cases c
+                JOIN runs r ON r.id = (
+                    SELECT r2.id FROM runs r2 WHERE r2.case_id = c.id
+                    ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1
+                )
+                LEFT JOIN reviews rv ON rv.run_id = r.id
+                WHERE c.status = 'open' AND r.status = 'completed' AND rv.id IS NULL
+                """
+            ).fetchall()
+            self._close(conn)
+
+        now = datetime.now(timezone.utc)
+        monitoring_due = sum(
+            1
+            for row in monitoring_rows
+            if (_parse_time(row["next_check_at"]) is None or _parse_time(row["next_check_at"]) <= now)
+        )
+        pending_review = 0
+        for row in pending_rows:
+            state = _safe_json(row["state_json"], {})
+            if isinstance(state, dict) and isinstance(state.get("primary_result"), dict) and state.get("primary_result"):
+                pending_review += 1
+
         accepted = 0
         comparable = 0
+        decisive_count = 0
+        uncertain_count = 0
+        sufficient = 0
+        verified_recent = 0
         review_delays: list[float] = []
         active_review_seconds: list[float] = []
-        sufficient = 0
-        now = datetime.now(timezone.utc)
-        verified_recent = 0
-        for row in decisive:
-            try:
-                run = self.get_run(row["run_id"])
-            except KeyError:
+
+        for row in review_rows:
+            decision = str(row["decision"] or "")
+            review_time = _parse_time(row["updated_at"] or row["created_at"])
+            if review_time and review_time >= now - timedelta(days=7):
+                verified_recent += 1
+            if decision == "uncertain":
+                uncertain_count += 1
                 continue
-            result = (run.get("state") or {}).get("primary_result", {})
+            decisive_count += 1
+
+            state = _safe_json(row["state_json"], {})
+            result = state.get("primary_result") if isinstance(state, dict) else {}
+            if not isinstance(result, dict):
+                result = {}
             label = str(result.get("label") or "")
             predicted_marketing: bool | None
             if label in {"高度营销化", "明显营销倾向"}:
@@ -1140,37 +1316,39 @@ class Store:
             else:
                 predicted_marketing = None
             if predicted_marketing is not None:
-                human_marketing = row["decision"] == "confirm_marketing"
+                human_marketing = decision == "confirm_marketing"
                 accepted += int(predicted_marketing == human_marketing)
                 comparable += 1
             sufficient += int(not (result.get("missing") or []))
-            run_time = _parse_time(run.get("updated_at"))
-            review_time = _parse_time(row.get("updated_at") or row.get("created_at"))
+
+            run_time = _parse_time(row["run_updated_at"])
             if run_time and review_time and review_time >= run_time:
                 review_delays.append((review_time - run_time).total_seconds())
-            if review_time and review_time >= now - timedelta(days=7):
-                verified_recent += 1
-            opened = self._latest_open_event(row["case_id"], row["run_id"], row["reviewer"], row["updated_at"])
-            opened_time = _parse_time(opened.get("created_at")) if opened else None
+            opened_time = _parse_time(row["opened_at"])
             if opened_time and review_time and review_time >= opened_time:
-                active_review_seconds.append(min(1800.0, max(10.0, (review_time - opened_time).total_seconds())))
+                active_review_seconds.append(
+                    min(1800.0, max(10.0, (review_time - opened_time).total_seconds()))
+                )
+
         verified_rate = None
         if len(active_review_seconds) >= 3 and sum(active_review_seconds) > 0:
             verified_rate = round(len(active_review_seconds) / (sum(active_review_seconds) / 3600), 2)
+        reviewed = len(review_rows)
+        cases = _safe_int(case_counts["cases"] if case_counts else 0)
+        open_cases = _safe_int(case_counts["open_cases"] if case_counts else 0)
+        archived_cases = _safe_int(case_counts["archived_cases"] if case_counts else 0)
         return {
-            "cases": len(cases),
-            "open_cases": sum(1 for case in cases if case["status"] == "open"),
-            "archived_cases": sum(1 for case in cases if case["status"] == "archived"),
-            "reviewed": len(reviews),
-            "pending_review": len(queue),
-            "monitoring_due": len(self.monitoring_queue(due_only=True)),
+            "cases": cases,
+            "open_cases": open_cases,
+            "archived_cases": archived_cases,
+            "reviewed": reviewed,
+            "pending_review": pending_review,
+            "monitoring_due": monitoring_due,
             "verified_last_7_days": verified_recent,
             "acceptance_rate": round(accepted / comparable, 4) if comparable else None,
             "overturn_rate": round(1 - accepted / comparable, 4) if comparable else None,
-            "uncertain_rate": round(
-                sum(1 for row in reviews if row["decision"] == "uncertain") / len(reviews), 4
-            ) if reviews else None,
-            "evidence_sufficiency_rate": round(sufficient / len(decisive), 4) if decisive else None,
+            "uncertain_rate": round(uncertain_count / reviewed, 4) if reviewed else None,
+            "evidence_sufficiency_rate": round(sufficient / decisive_count, 4) if decisive_count else None,
             "median_time_to_review_seconds": round(median(review_delays), 1) if review_delays else None,
             "verified_per_active_review_hour": verified_rate,
         }
@@ -1182,14 +1360,23 @@ class Store:
                 "SELECT run_id, decision, features_json FROM reviews WHERE decision != 'uncertain' ORDER BY created_at"
             ).fetchall()
             self._close(conn)
-        return [
-            LabeledExample(
-                FeatureVector(**json.loads(row["features_json"])),
-                1 if row["decision"] == "confirm_marketing" else 0,
-                row["run_id"],
+        examples: list[LabeledExample] = []
+        for row in rows:
+            raw = _safe_json(row["features_json"], {})
+            if not isinstance(raw, dict):
+                continue
+            try:
+                vector = FeatureVector(**raw)
+            except (TypeError, ValueError):
+                continue
+            examples.append(
+                LabeledExample(
+                    vector,
+                    1 if row["decision"] == "confirm_marketing" else 0,
+                    row["run_id"],
+                )
             )
-            for row in rows
-        ]
+        return examples
 
     def get_calibration(self) -> Calibration:
         return Calibration.from_dict(self._setting("calibration"))
@@ -1222,7 +1409,10 @@ class Store:
             conn = self._connect()
             row = conn.execute("SELECT value_json FROM settings WHERE key = ?", (key,)).fetchone()
             self._close(conn)
-        return json.loads(row["value_json"]) if row else None
+        if not row:
+            return None
+        parsed = _safe_json(row["value_json"], None)
+        return parsed if isinstance(parsed, dict) else None
 
     def _save_setting(self, key: str, value: dict[str, Any]) -> None:
         with self._lock:
@@ -1232,7 +1422,7 @@ class Store:
                 INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
                 """,
-                (key, json.dumps(value, ensure_ascii=False), utcnow_iso()),
+                (key, json.dumps(value, ensure_ascii=False, allow_nan=False), utcnow_iso()),
             )
             conn.commit()
             self._close(conn)
@@ -1268,11 +1458,12 @@ class Store:
     def _review_priority(result: dict[str, Any], priority: str) -> float:
         if not result:
             return 0.0
-        marketing = float(result.get("marketing_likelihood") or 0.0)
-        covert = float(result.get("covert_promotion_risk") or 0.0)
-        confidence = float(result.get("confidence") or 0.0)
-        stability = float(result.get("stability") or 0.0)
-        missing = len(result.get("missing") or [])
+        marketing = _safe_float(result.get("marketing_likelihood"))
+        covert = _safe_float(result.get("covert_promotion_risk"))
+        confidence = _safe_float(result.get("confidence"))
+        stability = _safe_float(result.get("stability"))
+        missing_value = result.get("missing") or []
+        missing = len(missing_value) if isinstance(missing_value, list) else 0
         score = 0.45 * marketing + 0.25 * covert + 0.15 * confidence + 0.15 * (1 - stability)
         score += min(0.09, missing * 0.02)
         score += 0.12 if priority == "high" else -0.04 if priority == "low" else 0.0
@@ -1280,19 +1471,21 @@ class Store:
 
     @staticmethod
     def _case_row(row: sqlite3.Row) -> dict[str, Any]:
+        targets = _safe_json(row["targets_json"], [])
+        tags = _safe_json(row["tags_json"], [])
         return {
             "id": row["id"],
             "title": row["title"],
             "goal": row["goal"],
-            "targets": json.loads(row["targets_json"]),
+            "targets": targets if isinstance(targets, list) else [],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "status": row["status"],
             "priority": row["priority"],
             "owner": row["owner"],
-            "tags": json.loads(row["tags_json"] or "[]"),
+            "tags": tags if isinstance(tags, list) else [],
             "monitoring_enabled": bool(row["monitoring_enabled"]),
-            "monitoring_interval_hours": int(row["monitoring_interval_hours"]),
+            "monitoring_interval_hours": max(1, _safe_int(row["monitoring_interval_hours"], 168)),
             "next_check_at": row["next_check_at"],
             "last_source_refresh_at": row["last_source_refresh_at"],
             "batch_id": row["batch_id"],
@@ -1301,8 +1494,12 @@ class Store:
     @classmethod
     def _case_summary(cls, row: sqlite3.Row) -> dict[str, Any]:
         payload = cls._case_row(row)
-        state = json.loads(row["latest_state_json"]) if row["latest_state_json"] else {}
+        state = _safe_json(row["latest_state_json"], {}) if row["latest_state_json"] else {}
+        if not isinstance(state, dict):
+            state = {}
         result = state.get("primary_result") or {}
+        if not isinstance(result, dict):
+            result = {}
         payload.update(
             {
                 "latest_run_id": row["latest_run_id"],
@@ -1319,11 +1516,12 @@ class Store:
 
     @staticmethod
     def _run_row(row: sqlite3.Row) -> dict[str, Any]:
+        state = _safe_json(row["state_json"], {})
         return {
             "id": row["id"],
             "case_id": row["case_id"],
             "status": row["status"],
-            "state": json.loads(row["state_json"]),
+            "state": state if isinstance(state, dict) else {},
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1362,12 +1560,13 @@ class Store:
 
     @staticmethod
     def _event_row(row: sqlite3.Row) -> dict[str, Any]:
+        metadata = _safe_json(row["metadata_json"], {})
         return {
             "id": row["id"],
             "actor": row["actor"],
             "event_type": row["event_type"],
             "case_id": row["case_id"],
             "run_id": row["run_id"],
-            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "metadata": metadata if isinstance(metadata, dict) else {},
             "created_at": row["created_at"],
         }
