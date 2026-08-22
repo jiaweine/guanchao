@@ -12,6 +12,7 @@ from .detection import Calibration, MarketingDetector
 from .domain import FeatureVector, RunEvent
 from .evolution import EvolutionEngine, EvolutionReport, LabeledExample
 from .policy import OwnedPolicy
+from .run_lock import run_claim
 from .semantic import SemanticEvidenceGateway
 from .store import Store
 from .tools import ToolRegistry
@@ -66,8 +67,6 @@ class AgentHarness:
             if self._closed:
                 return
             self._closed = True
-        # Let investigation workers finish first: a finishing run may still queue
-        # its trajectory into the learning executor.
         self._executor.shutdown(wait=True, cancel_futures=False)
         self._learning_executor.shutdown(wait=True, cancel_futures=False)
 
@@ -107,9 +106,6 @@ class AgentHarness:
             with self._guard:
                 for case_id, run_id in prepared[submitted:]:
                     self._fail_unsubmitted_run(case_id, run_id, "批量核查未启动")
-            # Submitted workers own their reservations and release them in
-            # _execute(). Only release reservations for work that never reached
-            # the executor; otherwise BoundedSemaphore can be double-released.
             for _ in range(len(case_ids) - submitted):
                 self._capacity.release()
             raise
@@ -130,41 +126,42 @@ class AgentHarness:
             acquired += 1
 
     def _prepare_run(self, case_id: str, message: str, actor: str) -> str:
-        case = self.store.get_case(case_id)
-        existing = self._active_cases.get(case_id)
-        if existing:
-            run = self.store.get_run(existing)
-            if run["status"] == "running":
-                raise ActiveRunError(existing)
-            if self._active_cases.get(case_id) == existing:
-                self._active_cases.pop(case_id, None)
-        db_active = self.store.active_run_for_case(case_id)
-        if db_active:
-            raise ActiveRunError(db_active["id"])
-        self.store.add_message(case_id, "user", message)
-        assets = self.store.list_assets(case_id, include_text=True)
-        state: dict[str, Any] = {
-            "goal": message or case["goal"],
-            "targets": case["targets"],
-            "assets": assets,
-            "sample_size": len(case["targets"][0].get("posts") or []) if case["targets"] else 0,
-            "completed_tools": [],
-            "events": [RunEvent.create("plan", "开始核查", "正在判断哪些证据最值得先看。", status="working").asdict()],
-            "evidence": [],
-            "tool_outputs": {},
-            "primary_result": {},
-            "answer": None,
-            "decision_count": 0,
-            "trajectory": [],
-        }
-        run = self.store.create_run(case_id, state, actor=actor)
-        self._active_cases[case_id] = run["id"]
-        return run["id"]
+        # The per-Harness RLock is not enough when two app workers share the same
+        # SQLite file. Hold a file-backed claim across the DB active-run check and
+        # insertion so both workers cannot create a running snapshot for one case.
+        with run_claim(self.store.path, case_id):
+            case = self.store.get_case(case_id)
+            existing = self._active_cases.get(case_id)
+            if existing:
+                run = self.store.get_run(existing)
+                if run["status"] == "running":
+                    raise ActiveRunError(existing)
+                if self._active_cases.get(case_id) == existing:
+                    self._active_cases.pop(case_id, None)
+            db_active = self.store.active_run_for_case(case_id)
+            if db_active:
+                raise ActiveRunError(db_active["id"])
+            self.store.add_message(case_id, "user", message)
+            assets = self.store.list_assets(case_id, include_text=True)
+            state: dict[str, Any] = {
+                "goal": message or case["goal"],
+                "targets": case["targets"],
+                "assets": assets,
+                "sample_size": len(case["targets"][0].get("posts") or []) if case["targets"] else 0,
+                "completed_tools": [],
+                "events": [RunEvent.create("plan", "开始核查", "正在判断哪些证据最值得先看。", status="working").asdict()],
+                "evidence": [],
+                "tool_outputs": {},
+                "primary_result": {},
+                "answer": None,
+                "decision_count": 0,
+                "trajectory": [],
+            }
+            run = self.store.create_run(case_id, state, actor=actor)
+            self._active_cases[case_id] = run["id"]
+            return run["id"]
 
     def _submit(self, run_id: str) -> None:
-        # A very fast worker can finish before submit() returns. The worker no
-        # longer removes itself from this registry; instead a done callback is
-        # installed *after* the mapping exists, which closes that race.
         future = self._executor.submit(self._execute, run_id)
         with self._guard:
             self._futures[run_id] = future
@@ -235,7 +232,6 @@ class AgentHarness:
             self._learning_future = future
 
     def evolve_now(self, actor: str = "local") -> EvolutionReport:
-        """Run manual evolution through the same serialized review pipeline."""
         with self._learning_guard:
             if self._closed:
                 raise RuntimeError("harness is closed")
@@ -249,9 +245,6 @@ class AgentHarness:
         state: dict[str, Any] | None = None
         completed = False
         try:
-            # Everything after reservation belongs inside this try/finally. A DB
-            # read, malformed setting, detector construction, or policy restore
-            # must not leak the inflight semaphore or active-case ownership.
             run = self.store.get_run(run_id)
             state = run["state"]
             case_id = run["case_id"]
@@ -331,9 +324,6 @@ class AgentHarness:
                 try:
                     self._schedule_trajectory_learning(run_id, state["trajectory"])
                 except Exception as exc:
-                    # Learning is a background optimization. A learning executor
-                    # outage must never rewrite a successful investigation as a
-                    # failed customer run.
                     try:
                         self.store.record_event(
                             "harness_learning_schedule_failed",
@@ -397,8 +387,6 @@ class AgentHarness:
         try:
             previous.result()
         except Exception:
-            # One failed learning job must not permanently poison the serialized
-            # queue. The next reconciliation reads durable DB state from scratch.
             pass
 
     def _apply_review_learning(
@@ -409,10 +397,6 @@ class AgentHarness:
         previous: Future | None = None,
     ) -> None:
         self._await_previous(previous)
-
-        # The HTTP request can be retried or edited while the learning queue is
-        # busy. Always converge to the review row that is currently persisted,
-        # rather than trusting an older queued request payload.
         stored_review = next(
             (row for row in self.store.review_rows() if row.get("run_id") == run_id),
             None,
@@ -492,15 +476,10 @@ class AgentHarness:
         examples: list[LabeledExample],
         profile: Any,
     ) -> tuple[EvolutionReport, bool, bool]:
-        # Rebuild from the cold-start prior whenever the decisive review dataset
-        # changes. This makes review edits/withdrawals reversible: parameters
-        # learned from labels that no longer exist cannot silently survive just
-        # because a new candidate failed an incremental promotion gate.
         baseline = Calibration()
         current = self.store.get_calibration()
         report = EvolutionEngine().evolve(baseline, examples, profile)
-        promoted = report.accepted
-        if promoted:
+        if report.accepted:
             self.store.save_calibration(report.calibration)
             return report, True, False
         reset = current != baseline
@@ -541,7 +520,7 @@ class AgentHarness:
                 continue
             state = run.get("state") or {}
             trajectory = list(state.get("trajectory") or [])
-            verdicts = [item for item in trajectory if item.get("action") == "verdict.compose"]
+            verdicts = [item for item in trajectory if isinstance(item, dict) and item.get("action") == "verdict.compose"]
             if not verdicts:
                 continue
             raw_features = verdicts[-1].get("features") or []
@@ -549,7 +528,9 @@ class AgentHarness:
                 continue
             try:
                 features = [float(value) for value in raw_features]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if any(not isinstance(value, float) or not (float("-inf") < value < float("inf")) for value in features):
                 continue
             predicted = _produced_marketing(
                 str((state.get("primary_result") or {}).get("label") or "")
@@ -565,11 +546,6 @@ class AgentHarness:
         return changed
 
     def review_examples(self) -> list[LabeledExample]:
-        # A case can be investigated repeatedly. Treating every run as an
-        # independent review leaks the same account across cross-validation
-        # folds and lets prolific cases dominate calibration. The latest human
-        # review is the case-level supervision state; an "uncertain" latest
-        # review withdraws that case from decisive training entirely.
         examples: list[LabeledExample] = []
         for case_id, row in self._latest_reviews_by_case().items():
             decision = str(row.get("decision") or "")
