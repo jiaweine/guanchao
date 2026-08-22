@@ -23,9 +23,6 @@ def _thread_lock(key: str) -> threading.Lock:
     with _LOCKS_GUARD:
         lock = _LOCKS.get(key)
         if lock is None:
-            # A plain Lock is intentional. Async acquisition may happen in one
-            # task/thread and release in another; logical re-entrancy is handled
-            # by the ContextVar below rather than by thread ownership.
             lock = threading.Lock()
             _LOCKS[key] = lock
         return lock
@@ -45,10 +42,6 @@ def _lock_path(db_path: str, case_id: str) -> Path | None:
 
 def _identity(db_path: str, case_id: str) -> tuple[str, Path | None]:
     path = _lock_path(db_path, case_id)
-    # Independent :memory: databases do not share durable state. Serializing a
-    # same-named case across them is harmless and, importantly, protects multiple
-    # Harness objects that share one in-memory Store from racing in different
-    # worker threads.
     key = str(path) if path is not None else f"memory:{case_id}"
     return key, path
 
@@ -102,8 +95,6 @@ def _release_file(descriptor: int | None) -> None:
 
 
 def _lease_case(case_id: str) -> bool:
-    # Internal global claims (currently learning reconciliation) are serialized
-    # by the same primitive but are not case/run ownership claims.
     return bool(case_id) and not case_id.startswith("__guanchao_")
 
 
@@ -113,19 +104,22 @@ def _before_case_claim(db_path: str, case_id: str) -> None:
 
 
 def _after_case_claim(db_path: str, case_id: str) -> None:
-    if _lease_case(case_id):
+    if not _lease_case(case_id):
+        return
+    try:
+        # This hook is supplementary. Harness.start performs a mandatory lease
+        # confirmation after it has the durable run_id and before executor submit,
+        # where failures can be rolled back to a failed run deterministically.
+        # A post-commit housekeeping failure must never turn an otherwise valid
+        # case mutation into a 500 or strand a run before the caller knows its id.
         observe_running_case(db_path, case_id)
+    except Exception:
+        return
 
 
 @contextmanager
 def run_claim(db_path: str, case_id: str) -> Iterator[None]:
-    """Serialize all evidence-snapshot mutations for one case.
-
-    Besides mutual exclusion, the outermost durable case claim now reconciles run
-    ownership: an expired crashed worker is failed before the caller inspects the
-    active row, and a run created inside the claim is adopted by this process and
-    heartbeated after the durable snapshot is committed.
-    """
+    """Serialize evidence-snapshot mutations and reclaim expired run owners."""
 
     key, path = _identity(db_path, case_id)
     held = _HELD_CLAIMS.get()
@@ -146,8 +140,6 @@ def run_claim(db_path: str, case_id: str) -> Iterator[None]:
         yield
         completed = True
     finally:
-        # Only adopt on a normally completed claim. A rejected/failed mutation may
-        # have observed somebody else's live run and must never claim its lease.
         if completed:
             _after_case_claim(db_path, case_id)
         if token is not None:
@@ -158,13 +150,7 @@ def run_claim(db_path: str, case_id: str) -> Iterator[None]:
 
 @asynccontextmanager
 async def async_run_claim(db_path: str, case_id: str) -> AsyncIterator[None]:
-    """Async, cancellation-safe form of :func:`run_claim`.
-
-    Acquisition uses non-blocking polling instead of parking a thread in flock or
-    Lock.acquire. Lease reconciliation itself is deliberately tiny SQLite work and
-    runs while the cross-process case claim is held, so a cancelled request cannot
-    leave a background adoption task racing after the lock has been released.
-    """
+    """Async, cancellation-safe form of :func:`run_claim`."""
 
     key, path = _identity(db_path, case_id)
     held = _HELD_CLAIMS.get()
