@@ -16,6 +16,13 @@ _COMMERCIAL_RE = re.compile(r"(?:新品|上新|补货|返场|爆款|同款|官�
 _AUTHENTIC_RE = re.compile(r"(?:我原本|后来|没想到|踩坑|不适合|缺点|但是|不过|真实感受|用了\d+天|用了\d+周|个人体验|仅代表个人|我自己|我还是|其实没有)")
 _OPERATION_RE = re.compile(r"(?:商务|合作|客服|门店|直播|橱窗|团购|招商|选品|供应链|矩阵|工作室|顾问|运营|投放|定制)")
 
+# Feature extraction is intentionally bounded. Imported text is untrusted and
+# several helpers create token/shingle sets; clipping here prevents a single
+# pathological post from turning an otherwise linear investigation into a large
+# memory allocation.
+MAX_PATTERN_TEXT_CHARS = 4_000
+MAX_PATTERN_POSTS = 80
+
 _INTERACTIONS: dict[str, tuple[str, str]] = {
     "intent_action": ("commercial_language", "call_to_action"),
     "action_contact": ("call_to_action", "contact_pressure"),
@@ -26,7 +33,6 @@ _INTERACTIONS: dict[str, tuple[str, str]] = {
     "action_persistence": ("call_to_action", "call_to_action"),
     "contact_persistence": ("contact_pressure", "contact_pressure"),
 }
-
 
 
 def interaction_value(features: FeatureVector, key: str) -> float:
@@ -40,11 +46,12 @@ def interaction_value(features: FeatureVector, key: str) -> float:
 
 
 def _tokens(text: str) -> list[str]:
-    return [m.group(0).lower() for m in _WORD_RE.finditer(text)]
+    bounded = (text or "")[:MAX_PATTERN_TEXT_CHARS]
+    return [m.group(0).lower() for m in _WORD_RE.finditer(bounded)]
 
 
 def _shingles(text: str, size: int = 3) -> set[str]:
-    compact = re.sub(r"\s+", "", text.lower())
+    compact = re.sub(r"\s+", "", (text or "")[:MAX_PATTERN_TEXT_CHARS].lower())
     compact = re.sub(r"\d+", "#", compact)
     return (
         {compact}
@@ -54,7 +61,7 @@ def _shingles(text: str, size: int = 3) -> set[str]:
 
 
 def _hit(text: str, pattern: re.Pattern[str]) -> float:
-    return 1.0 if text and pattern.search(text) else 0.0
+    return 1.0 if text and pattern.search(text[:MAX_PATTERN_TEXT_CHARS]) else 0.0
 
 
 def _robust_rate(texts: Iterable[str], pattern: re.Pattern[str]) -> float:
@@ -64,7 +71,7 @@ def _robust_rate(texts: Iterable[str], pattern: re.Pattern[str]) -> float:
     across a long account history. Density preserves repeated cues inside a post,
     while the Wilson lower bound supplies the sample-size penalty.
     """
-    items = [t for t in texts if t]
+    items = [(t or "")[:MAX_PATTERN_TEXT_CHARS] for t in texts if t][:MAX_PATTERN_POSTS]
     if not items:
         return 0.0
     hits = sum(1 for t in items if pattern.search(t))
@@ -86,10 +93,15 @@ def _wilson_lower(hits: int, total: int, z: float = 1.0) -> float:
 
 
 def _repeated_phrase_pressure(texts: list[str]) -> float:
-    if len(texts) < 2:
+    bounded = [
+        (text or "")[:MAX_PATTERN_TEXT_CHARS]
+        for text in texts[:MAX_PATTERN_POSTS]
+        if text
+    ]
+    if len(bounded) < 2:
         return 0.0
     chunks: dict[str, int] = {}
-    for text in texts:
+    for text in bounded:
         normalized = re.sub(r"\s+", "", text)
         seen = set()
         for n in (5, 6, 7):
@@ -99,7 +111,7 @@ def _repeated_phrase_pressure(texts: list[str]) -> float:
                     continue
                 seen.add(chunk)
                 chunks[chunk] = chunks.get(chunk, 0) + 1
-    repeated = sum(1 for count in chunks.values() if count >= max(2, math.ceil(len(texts) * 0.4)))
+    repeated = sum(1 for count in chunks.values() if count >= max(2, math.ceil(len(bounded) * 0.4)))
     return _clamp(repeated / 24)
 
 
