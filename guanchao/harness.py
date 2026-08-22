@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
@@ -128,9 +129,6 @@ class AgentHarness:
             acquired += 1
 
     def _prepare_run(self, case_id: str, message: str, actor: str) -> str:
-        # The per-Harness RLock is not enough when two app workers share the same
-        # SQLite file. Hold a file-backed claim across the DB active-run check and
-        # insertion so both workers cannot create a running snapshot for one case.
         with run_claim(self.store.path, case_id):
             case = self.store.get_case(case_id)
             existing = self._active_cases.get(case_id)
@@ -159,7 +157,17 @@ class AgentHarness:
                 "decision_count": 0,
                 "trajectory": [],
             }
-            run = self.store.create_run(case_id, state, actor=actor)
+            try:
+                run = self.store.create_run(case_id, state, actor=actor)
+            except sqlite3.IntegrityError:
+                # The partial unique index is the last line of defence on systems
+                # where cross-process flock is unavailable or bypassed. Translate
+                # its expected collision into the same product-level conflict as
+                # the optimistic active-run check rather than leaking a 500.
+                active = self.store.active_run_for_case(case_id)
+                if active:
+                    raise ActiveRunError(active["id"]) from None
+                raise
             self._active_cases[case_id] = run["id"]
             return run["id"]
 
@@ -373,9 +381,6 @@ class AgentHarness:
         previous: Future | None = None,
     ) -> None:
         self._await_previous(previous)
-        # Each worker has its own single-thread learning executor. Serialize the
-        # durable read-modify-write as well, otherwise two workers can both read
-        # the same profile and the last save silently loses the other's update.
         with run_claim(self.store.path, _LEARNING_CLAIM):
             profile = self.store.get_policy_profile()
             profile.observe(trajectory)
@@ -422,9 +427,10 @@ class AgentHarness:
                 human = decision == "confirm_marketing"
                 review_correct = None if predicted is None else predicted == human
 
+            latest = self._latest_reviews_by_case()
             profile = self.store.get_policy_profile()
-            profile_changed = self._sync_review_feedback(profile)
-            examples = self.review_examples()
+            profile_changed = self._sync_review_feedback(profile, latest)
+            examples = self.review_examples(latest)
             fingerprint = self._review_dataset_fingerprint(examples)
             dataset_changed = fingerprint != profile.review_dataset_fingerprint
             calibration_promoted = False
@@ -471,9 +477,10 @@ class AgentHarness:
     ) -> EvolutionReport:
         self._await_previous(previous)
         with run_claim(self.store.path, _LEARNING_CLAIM):
+            latest = self._latest_reviews_by_case()
             profile = self.store.get_policy_profile()
-            self._sync_review_feedback(profile)
-            examples = self.review_examples()
+            self._sync_review_feedback(profile, latest)
+            examples = self.review_examples(latest)
             report, _, _ = self._fit_review_dataset(examples, profile)
             profile.review_dataset_fingerprint = self._review_dataset_fingerprint(examples)
             self.store.save_policy_profile(profile)
@@ -496,39 +503,32 @@ class AgentHarness:
         return report, False, reset
 
     def _latest_reviews_by_case(self) -> dict[str, dict[str, Any]]:
-        latest: dict[str, dict[str, Any]] = {}
-        for row in self.store.review_rows():
-            case_id = str(row.get("case_id") or "")
-            if not case_id:
-                continue
-            previous = latest.get(case_id)
-            rank = (
-                str(row.get("updated_at") or ""),
-                str(row.get("created_at") or ""),
-                str(row.get("id") or ""),
-            )
-            previous_rank = (
-                str(previous.get("updated_at") or ""),
-                str(previous.get("created_at") or ""),
-                str(previous.get("id") or ""),
-            ) if previous else None
-            if previous is None or rank >= previous_rank:
-                latest[case_id] = row
-        return latest
+        return {
+            str(row.get("case_id")): row
+            for row in self.store.latest_review_snapshots()
+            if row.get("case_id")
+        }
 
-    def _sync_review_feedback(self, profile: Any) -> bool:
+    def _sync_review_feedback(
+        self,
+        profile: Any,
+        latest: dict[str, dict[str, Any]] | None = None,
+    ) -> bool:
         desired: dict[str, dict[str, Any]] = {}
-        for case_id, row in self._latest_reviews_by_case().items():
+        latest = latest if latest is not None else self._latest_reviews_by_case()
+        for case_id, row in latest.items():
             decision = str(row.get("decision") or "")
             if decision == "uncertain":
                 continue
-            try:
-                run = self.store.get_run(str(row.get("run_id") or ""))
-            except KeyError:
+            state = row.get("run_state") or {}
+            if not isinstance(state, dict):
                 continue
-            state = run.get("state") or {}
             trajectory = list(state.get("trajectory") or [])
-            verdicts = [item for item in trajectory if isinstance(item, dict) and item.get("action") == "verdict.compose"]
+            verdicts = [
+                item
+                for item in trajectory
+                if isinstance(item, dict) and item.get("action") == "verdict.compose"
+            ]
             if not verdicts:
                 continue
             raw_features = verdicts[-1].get("features") or []
@@ -538,7 +538,7 @@ class AgentHarness:
                 features = [float(value) for value in raw_features]
             except (TypeError, ValueError, OverflowError):
                 continue
-            if any(not isinstance(value, float) or not (float("-inf") < value < float("inf")) for value in features):
+            if any(not (float("-inf") < value < float("inf")) for value in features):
                 continue
             predicted = _produced_marketing(
                 str((state.get("primary_result") or {}).get("label") or "")
@@ -553,19 +553,25 @@ class AgentHarness:
             profile.reviews = len(desired)
         return changed
 
-    def review_examples(self) -> list[LabeledExample]:
+    def review_examples(
+        self,
+        latest: dict[str, dict[str, Any]] | None = None,
+    ) -> list[LabeledExample]:
         examples: list[LabeledExample] = []
-        for case_id, row in self._latest_reviews_by_case().items():
+        latest = latest if latest is not None else self._latest_reviews_by_case()
+        for case_id, row in latest.items():
             decision = str(row.get("decision") or "")
             if decision == "uncertain":
                 continue
+            state = row.get("run_state") or {}
+            if not isinstance(state, dict):
+                continue
+            features = (state.get("primary_result") or {}).get("features")
+            if not isinstance(features, dict):
+                continue
             try:
-                reviewed_run = self.store.get_run(str(row.get("run_id") or ""))
-                features = (reviewed_run.get("state") or {}).get("primary_result", {}).get("features")
-                if not isinstance(features, dict):
-                    continue
                 vector = FeatureVector(**features)
-            except (KeyError, TypeError, ValueError):
+            except (TypeError, ValueError):
                 continue
             examples.append(
                 LabeledExample(
