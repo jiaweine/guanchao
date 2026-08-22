@@ -82,9 +82,6 @@ class Store:
             return self._memory_conn
         conn = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        # journal_mode is persistent and is set once in _init(). Reissuing it on
-        # every hot-path read takes a schema lock and becomes surprisingly costly
-        # with many short-lived connections under concurrent API traffic.
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=15000")
@@ -224,12 +221,62 @@ class Store:
                 ("batch_id", "TEXT"),
             ):
                 self._ensure_column(conn, "cases", name, definition)
+
+            # Older workers could race the active-run check and leave multiple
+            # durable running rows for one case. Repair those legacy collisions
+            # before adding the DB-level invariant so an upgrade never fails just
+            # because the protection is being introduced after the fact.
+            now = utcnow_iso()
+            duplicate_cases = conn.execute(
+                """
+                SELECT case_id FROM runs
+                WHERE status = 'running'
+                GROUP BY case_id HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+            for duplicate in duplicate_cases:
+                case_id = duplicate["case_id"]
+                winner = conn.execute(
+                    """
+                    SELECT id FROM runs
+                    WHERE case_id = ? AND status = 'running'
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                    """,
+                    (case_id,),
+                ).fetchone()
+                if not winner:
+                    continue
+                stale = conn.execute(
+                    "SELECT id FROM runs WHERE case_id = ? AND status = 'running' AND id != ?",
+                    (case_id, winner["id"]),
+                ).fetchall()
+                for row in stale:
+                    conn.execute(
+                        "UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO events VALUES (?, 'system', 'run_duplicate_recovered', ?, ?, ?, ?)",
+                        (
+                            uuid.uuid4().hex[:12],
+                            case_id,
+                            row["id"],
+                            json.dumps(
+                                {"kept_run_id": winner["id"], "reason": "duplicate_running"},
+                                ensure_ascii=False,
+                            ),
+                            now,
+                        ),
+                    )
+
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_case_created ON messages(case_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_comments_case_created ON comments(case_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_case_created ON runs(case_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_case_status_created ON runs(case_id, status, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_running_case
+                    ON runs(case_id) WHERE status = 'running';
                 CREATE INDEX IF NOT EXISTS idx_assets_case_created ON assets(case_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_reviews_case_created ON reviews(case_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_reviews_decision ON reviews(decision, created_at DESC);
@@ -243,7 +290,6 @@ class Store:
                     ON events(event_type, case_id, run_id, actor, created_at DESC);
                 """
             )
-            now = utcnow_iso()
             conn.execute(
                 """
                 INSERT INTO members(id, display_name, role, active, created_at, updated_at)
@@ -545,9 +591,6 @@ class Store:
             params.append(batch_id)
 
         normalized = query.strip().lower()
-        # Coarse SQL predicates reduce the working set while the exact Python
-        # check below preserves the historical semantics (title/goal/handle/name,
-        # not arbitrary bio/post text stored inside targets_json).
         if normalized:
             like = f"%{normalized}%"
             clauses.append(
@@ -1032,6 +1075,42 @@ class Store:
             self._close(conn)
         return [self._review_row(row) for row in rows]
 
+    def latest_review_snapshots(self) -> list[dict[str, Any]]:
+        """Return one latest human supervision row per case with its run state.
+
+        Review learning used to call review_rows() and then get_run() once or
+        twice per case. Keeping the join in SQLite makes each reconciliation a
+        constant number of DB round trips even when the review history is large.
+        """
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT rv.*,
+                           r.status AS run_status,
+                           r.state_json AS run_state_json,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY rv.case_id
+                               ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC
+                           ) AS review_rank
+                    FROM reviews rv
+                    LEFT JOIN runs r ON r.id = rv.run_id
+                ) ranked
+                WHERE review_rank = 1
+                ORDER BY case_id
+                """
+            ).fetchall()
+            self._close(conn)
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._review_row(row)
+            state = _safe_json(row["run_state_json"], {})
+            item["run_status"] = row["run_status"]
+            item["run_state"] = state if isinstance(state, dict) else {}
+            result.append(item)
+        return result
+
     def review_queue(
         self,
         reviewed: bool | None = False,
@@ -1224,10 +1303,6 @@ class Store:
             return result
 
     def _compute_product_metrics(self) -> dict[str, Any]:
-        # Keep this path O(queries + reviews), not O(cases + reviews * queries).
-        # The old implementation materialized every case and then issued get_run
-        # and event lookups one review at a time, which becomes the dominant cost
-        # on workspaces with thousands of historical investigations.
         with self._lock:
             conn = self._connect()
             case_counts = conn.execute(
@@ -1273,11 +1348,11 @@ class Store:
             self._close(conn)
 
         now = datetime.now(timezone.utc)
-        monitoring_due = sum(
-            1
-            for row in monitoring_rows
-            if (_parse_time(row["next_check_at"]) is None or _parse_time(row["next_check_at"]) <= now)
-        )
+        monitoring_due = 0
+        for row in monitoring_rows:
+            next_check = _parse_time(row["next_check_at"])
+            if next_check is None or next_check <= now:
+                monitoring_due += 1
         pending_review = 0
         for row in pending_rows:
             state = _safe_json(row["state_json"], {})
