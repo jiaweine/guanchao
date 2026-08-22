@@ -1,5 +1,8 @@
 import json
 
+from fastapi.testclient import TestClient
+
+from guanchao.api import create_app
 from guanchao.domain import FeatureVector
 from guanchao.post_training import PostTrainingCorpusBuilder
 from guanchao.store import Store
@@ -48,8 +51,8 @@ def test_post_training_export_binds_review_to_exact_run():
     assert rows[0]["review"]["reason"] == "证据充分"
 
 
-def test_store_export_uses_one_query_and_never_loads_full_case_histories(tmp_path, monkeypatch):
-    store = Store(str(tmp_path / "post-training.sqlite"))
+def _reviewed_store(db_path: str) -> tuple[Store, dict, dict]:
+    store = Store(db_path)
     target = {
         "platform": "weibo",
         "handle": "training-one-query",
@@ -72,6 +75,11 @@ def test_store_export_uses_one_query_and_never_loads_full_case_histories(tmp_pat
     run = store.create_run(case["id"], state)
     store.update_run(run["id"], state, "completed")
     store.add_review(case["id"], run["id"], "confirm_ordinary", reason="人工确认")
+    return store, case, run
+
+
+def test_store_export_uses_one_query_and_never_loads_full_case_histories(tmp_path, monkeypatch):
+    store, case, run = _reviewed_store(str(tmp_path / "post-training.sqlite"))
 
     monkeypatch.setattr(
         store,
@@ -100,3 +108,46 @@ def test_store_export_uses_one_query_and_never_loads_full_case_histories(tmp_pat
     assert rows[0]["goal"] == "精确复核"
     assert rows[0]["human_label"] == 0
     assert rows[0]["review"]["reason"] == "人工确认"
+
+
+def test_http_post_training_export_does_not_regress_to_get_case_n_plus_one(tmp_path, monkeypatch):
+    db = str(tmp_path / "post-training-http.sqlite")
+    app = create_app(db)
+    store = app.state.store
+    target = {
+        "platform": "weibo",
+        "handle": "training-http",
+        "posts": [{"id": "p1", "text": "今天散步"}],
+    }
+    case = store.create_case("HTTP 训练导出", "核查", [target])
+    state = {
+        "goal": "HTTP 精确复核",
+        "targets": [target],
+        "assets": [],
+        "events": [],
+        "answer": "更像普通创作者",
+        "primary_result": {
+            "label": "更像普通创作者",
+            "features": FeatureVector().asdict(),
+        },
+    }
+    run = store.create_run(case["id"], state)
+    store.update_run(run["id"], state, "completed")
+    store.add_review(case["id"], run["id"], "confirm_ordinary", reason="HTTP 人工确认")
+
+    monkeypatch.setattr(
+        store,
+        "get_case",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("HTTP export regressed to per-case loading")
+        ),
+    )
+    try:
+        response = TestClient(app).get("/api/post-training/export")
+        assert response.status_code == 200
+        rows = [json.loads(line) for line in response.text.splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == run["id"]
+        assert rows[0]["review"]["reason"] == "HTTP 人工确认"
+    finally:
+        app.state.harness.close()
