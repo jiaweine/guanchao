@@ -16,9 +16,18 @@ from fastapi.responses import JSONResponse, Response
 
 from .api_core import MAX_UPLOAD_BYTES, create_app as create_core_app
 from .multimodal import infer_kind
+from .run_lock import async_run_claim
 
 IDEMPOTENCY_TTL_SECONDS = 600.0
 IDEMPOTENCY_CACHE_LIMIT = 256
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
 
 
 def _case_id_from_path(path: str) -> str | None:
@@ -106,7 +115,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     idempotency_inflight: dict[
         str, tuple[str, asyncio.Future[tuple[int, dict[str, str], bytes] | None]]
     ] = {}
-    perception_slots = asyncio.Semaphore(max(1, int(os.getenv('GUANCHAO_PERCEPTION_WORKERS', '4'))))
+    perception_slots = asyncio.Semaphore(
+        _env_int('GUANCHAO_PERCEPTION_WORKERS', 4, 1, 64)
+    )
 
     def lock_for(case_id: str) -> asyncio.Lock:
         lock = case_locks.get(case_id)
@@ -151,7 +162,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         )
             if owner:
                 break
-            record = await future
+            record = await asyncio.shield(future)
             if record is not None:
                 return _response_from_record(record)
 
@@ -312,8 +323,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         async def serialized_dispatch():
             if _serialize_case_mutation(path, method, case_id):
+                # The asyncio lock prevents same-process coroutine crossings; the
+                # file-backed claim extends the exact same evidence-snapshot
+                # critical section to other app workers/processes. Harness.start
+                # uses the synchronous form and re-enters through ContextVar when
+                # a target refresh/message starts a run inside this request.
                 async with lock_for(case_id):
-                    return await dispatch()
+                    async with async_run_claim(app.state.store.path, case_id):
+                        return await dispatch()
             return await dispatch()
 
         base = _idempotency_base(request)

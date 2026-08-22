@@ -9,6 +9,17 @@ AssetKind = Literal["image", "video", "audio", "document", "other"]
 AssetStatus = Literal["pending", "ready", "error"]
 _ALLOWED_PLATFORMS = {"xiaohongshu", "weibo", "douyin", "bilibili", "other"}
 
+# Investigation inputs are user-controlled and feed several tokenization / pairwise
+# comparison paths. Keep a generous recent-history window while making memory and
+# CPU cost bounded even when an imported JSON/CSV row is malformed or enormous.
+MAX_POSTS_PER_ACCOUNT = 200
+MAX_POST_TEXT_CHARS = 12_000
+MAX_BIO_CHARS = 12_000
+MAX_ID_CHARS = 256
+MAX_NAME_CHARS = 256
+MAX_URL_CHARS = 2_048
+MAX_TIMESTAMP_CHARS = 96
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -19,6 +30,29 @@ def _safe_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _safe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on", "是", "已认证"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "", "否", "未认证"}:
+            return False
+    return False
+
+
+def _safe_text(value: Any, limit: int, *, strip: bool = True) -> str:
+    text = "" if value is None else str(value)
+    if strip:
+        text = text.strip()
+    return text[: max(0, int(limit))]
 
 
 @dataclass(slots=True)
@@ -36,16 +70,18 @@ class PostSnapshot:
     def from_dict(cls, raw: dict[str, Any], index: int = 0) -> "PostSnapshot":
         if not isinstance(raw, dict):
             raise TypeError("post must be an object")
-        stamp = raw.get("published_at") or raw.get("timestamp")
+        stamp = raw.get("published_at") or raw.get("timestamp") or raw.get("created_at")
+        raw_text = raw.get("text") or raw.get("caption") or raw.get("title") or ""
+        raw_url = raw.get("url")
         return cls(
-            id=str(raw.get("id") or f"post-{index + 1}"),
-            text=str(raw.get("text") or raw.get("caption") or raw.get("title") or "").strip(),
-            published_at=str(stamp) if stamp is not None else None,
+            id=_safe_text(raw.get("id") or f"post-{index + 1}", MAX_ID_CHARS) or f"post-{index + 1}",
+            text=_safe_text(raw_text, MAX_POST_TEXT_CHARS),
+            published_at=_safe_text(stamp, MAX_TIMESTAMP_CHARS) if stamp is not None else None,
             likes=_safe_int(raw.get("likes")),
             comments=_safe_int(raw.get("comments")),
             shares=_safe_int(raw.get("shares")),
             views=_safe_int(raw.get("views")),
-            url=str(raw.get("url")) if raw.get("url") else None,
+            url=_safe_text(raw_url, MAX_URL_CHARS) if raw_url else None,
         )
 
 
@@ -68,19 +104,24 @@ class AccountSnapshot:
         posts_raw = raw.get("posts") or []
         if not isinstance(posts_raw, list):
             raise TypeError("posts must be a list")
-        platform = str(raw.get("platform") or "other").strip().lower()
+        platform = _safe_text(raw.get("platform") or "other", 32).lower()
         if platform not in _ALLOWED_PLATFORMS:
             platform = "other"
+        raw_profile_url = raw.get("profile_url") or raw.get("url")
+        handle = _safe_text(raw.get("handle") or raw.get("account") or "unknown", MAX_ID_CHARS)
         return cls(
             platform=platform,  # type: ignore[arg-type]
-            handle=str(raw.get("handle") or raw.get("account") or "unknown").strip() or "unknown",
-            display_name=str(raw.get("display_name") or raw.get("name") or "").strip(),
-            bio=str(raw.get("bio") or "").strip(),
+            handle=handle or "unknown",
+            display_name=_safe_text(raw.get("display_name") or raw.get("name") or "", MAX_NAME_CHARS),
+            bio=_safe_text(raw.get("bio") or "", MAX_BIO_CHARS),
             followers=_safe_int(raw.get("followers")),
             following=_safe_int(raw.get("following")),
-            verified=bool(raw.get("verified") or False),
-            profile_url=str(raw.get("profile_url") or raw.get("url")) if (raw.get("profile_url") or raw.get("url")) else None,
-            posts=[PostSnapshot.from_dict(item, i) for i, item in enumerate(posts_raw)],
+            verified=_safe_bool(raw.get("verified")),
+            profile_url=_safe_text(raw_profile_url, MAX_URL_CHARS) if raw_profile_url else None,
+            posts=[
+                PostSnapshot.from_dict(item, i)
+                for i, item in enumerate(posts_raw[:MAX_POSTS_PER_ACCOUNT])
+            ],
         )
 
     def asdict(self) -> dict[str, Any]:

@@ -6,6 +6,9 @@ from typing import Callable
 from .detection import MarketingDetector
 from .domain import AccountSnapshot, Evidence, ToolResult
 
+MAX_MEDIA_EVIDENCE_CHARS = 64_000
+MAX_EVIDENCE_ASSET_REFS = 32
+
 
 @dataclass(slots=True)
 class ToolSpec:
@@ -47,11 +50,18 @@ class ToolRegistry:
 
     @staticmethod
     def _media_text(state: dict) -> str:
-        return "\n".join(
-            str(asset.get("extracted_text") or "")
-            for asset in state.get("assets") or []
-            if asset.get("status") == "ready"
-        )
+        chunks: list[str] = []
+        remaining = MAX_MEDIA_EVIDENCE_CHARS
+        for asset in state.get("assets") or []:
+            if asset.get("status") != "ready" or remaining <= 0:
+                continue
+            text = str(asset.get("extracted_text") or "")
+            if not text:
+                continue
+            piece = text[:remaining]
+            chunks.append(piece)
+            remaining -= len(piece)
+        return "\n".join(chunks)[:MAX_MEDIA_EVIDENCE_CHARS]
 
     def _workspace(self, state: dict) -> ToolResult:
         targets = [AccountSnapshot.from_dict(item) for item in state.get("targets") or []]
@@ -105,6 +115,7 @@ class ToolRegistry:
         account = self._primary(state)
         features, evidence, _ = self.detector.extract(account, self._media_text(state))
         selected = [item for item in evidence if item.key in {"media_commerciality", "identity_consistency"}]
+        ready_ids = [asset["id"] for asset in ready[:MAX_EVIDENCE_ASSET_REFS] if asset.get("id")]
         if ready and not selected:
             selected = [
                 Evidence(
@@ -113,12 +124,12 @@ class ToolRegistry:
                     "已读取的图片、视频、音频或文档没有提取到集中转化信息。",
                     max(0.0, 1.0 - features.media_commerciality),
                     "against",
-                    asset_ids=[asset["id"] for asset in ready],
+                    asset_ids=ready_ids,
                 )
             ]
         else:
             for item in selected:
-                item.asset_ids = [asset["id"] for asset in ready]
+                item.asset_ids = ready_ids
         summary = f"已读取 {len(ready)} 份素材" + (
             f"，{len(pending)} 份仍待补充解析。" if pending else "并完成交叉核对。"
         )

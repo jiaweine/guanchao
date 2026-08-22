@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import threading
@@ -13,15 +14,24 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .domain import AccountSnapshot
-from .evolution import EvolutionEngine
 from .harness import ActiveRunError, AgentHarness, RunCapacityError
 from .multimodal import PerceptionGateway, infer_kind
 from .post_training import PostTrainingCorpusBuilder
 from .reporting import ReportBuilder
+from .run_lock import async_run_claim
 from .sample_data import demo_target
 from .store import Store
 
-MAX_UPLOAD_BYTES = int(os.getenv("GUANCHAO_MAX_UPLOAD_MB", "30")) * 1024 * 1024
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+MAX_UPLOAD_BYTES = _env_int("GUANCHAO_MAX_UPLOAD_MB", 30, 1, 512) * 1024 * 1024
 
 
 class CaseCreate(BaseModel):
@@ -94,11 +104,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
     store = Store(db_path or os.getenv("GUANCHAO_DB", "guanchao.db"))
     harness = AgentHarness(store)
     perception = PerceptionGateway()
+    perception_slots = threading.BoundedSemaphore(
+        _env_int("GUANCHAO_PERCEPTION_WORKERS", 2, 1, 64)
+    )
     store.purge_retention(actor="system")
     app = FastAPI(title="Guanchao", docs_url="/docs", redoc_url=None)
     app.state.store = store
     app.state.harness = harness
     app.state.perception = perception
+    app.add_event_handler("shutdown", harness.close)
     trust_actor_header = os.getenv("GUANCHAO_TRUST_ACTOR_HEADER", "0").strip().lower() in {"1", "true", "yes"}
     view_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
     view_cache_lock = threading.RLock()
@@ -159,11 +173,50 @@ def create_app(db_path: str | None = None) -> FastAPI:
         payload["result"] = compact_result(item.get("result")) or {}
         return payload
 
+    def mutation_case_id(request: Request) -> str | None:
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return None
+        parts = [part for part in request.url.path.split("/") if part]
+        if len(parts) < 3 or parts[0] != "api" or parts[1] != "cases":
+            return None
+        candidate = parts[2]
+        if candidate == "batch":
+            return None
+        return candidate[:64]
+
+    def extract_with_capacity(storage_path: str, kind: str, content_type: str) -> tuple[str, str]:
+        with perception_slots:
+            return perception.extract(storage_path, kind, content_type)
+
+    async def await_perception_settlement(
+        storage_path: str,
+        kind: str,
+        content_type: str,
+    ) -> tuple[tuple[str, str] | None, BaseException | None, asyncio.CancelledError | None]:
+        task = asyncio.create_task(
+            asyncio.to_thread(extract_with_capacity, storage_path, kind, content_type)
+        )
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                return result, None, cancelled
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                continue
+            except BaseException as exc:
+                return None, exc, cancelled
+
     @app.middleware("http")
-    async def clear_cached_views_on_write(request: Request, call_next: Any) -> Response:
+    async def protect_case_mutations(request: Request, call_next: Any) -> Response:
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             invalidate_view_cache()
-        return await call_next(request)
+        case_id = mutation_case_id(request)
+        if not case_id:
+            return await call_next(request)
+        async with async_run_claim(store.path, case_id):
+            return await call_next(request)
 
     def actor(request: Request) -> dict[str, Any]:
         member_id = "local"
@@ -281,15 +334,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         limit: int = Query(default=200, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         actor(request)
-        key = ("cases", query, platform, status, owner, priority, sort, batch_id)
-        items = cached_view(
+        key = ("cases", query, platform, status, owner, priority, sort, batch_id, limit)
+        return cached_view(
             key,
             lambda: [
                 compact_case_summary(item)
-                for item in store.list_cases(query, platform, status, owner, priority, sort, batch_id)
+                for item in store.list_cases(
+                    query, platform, status, owner, priority, sort, batch_id, limit=limit
+                )
             ],
         )
-        return items[:limit]
 
     @app.post("/api/cases")
     def create_case(payload: CaseCreate, request: Request) -> dict[str, Any]:
@@ -383,6 +437,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if payload.rerun:
             try:
                 run_id = harness.start(case_id, payload.message.strip(), actor=current["id"])
+            except ActiveRunError as exc:
+                raise HTTPException(409, f"当前任务已有核查在进行：{exc}") from exc
             except RunCapacityError as exc:
                 raise HTTPException(429, "当前核查队列已满，请稍后重新发起") from exc
         return {"case": case, "run_id": run_id}
@@ -431,8 +487,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             Path(storage_path).unlink(missing_ok=True)
             raise
 
-        try:
-            extracted, asset_status = perception.extract(storage_path, kind, content_type)
+        perception_result, perception_error, cancelled = await await_perception_settlement(
+            storage_path, kind, content_type
+        )
+        if perception_error is None and perception_result is not None:
+            extracted, asset_status = perception_result
             note = (
                 "已读取"
                 if asset_status == "ready"
@@ -447,14 +506,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 note=note,
                 error="" if asset_status != "error" else "perception_failed",
             )
-        except Exception:
+        else:
             store.update_asset(
                 asset.id,
                 "error",
                 note="解析失败，可重新上传或检查本地感知服务",
                 error="perception_failed",
             )
-        return store.get_asset(asset.id, include_text=False)
+        settled = store.get_asset(asset.id, include_text=False)
+        if cancelled is not None:
+            raise cancelled
+        return settled
 
     @app.delete("/api/cases/{case_id}/assets/{asset_id}")
     def delete_asset(case_id: str, asset_id: str, request: Request) -> dict[str, bool]:
@@ -514,15 +576,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         limit: int = Query(default=200, ge=1, le=500),
     ) -> list[dict[str, Any]]:
         actor(request)
-        key = ("review-queue", reviewed, query, platform, owner, priority, sort)
-        items = cached_view(
+        key = ("review-queue", reviewed, query, platform, owner, priority, sort, limit)
+        return cached_view(
             key,
             lambda: [
                 compact_review_summary(item)
-                for item in store.review_queue(reviewed, query, platform, owner, priority, sort)
+                for item in store.review_queue(
+                    reviewed, query, platform, owner, priority, sort, limit=limit
+                )
             ],
         )
-        return items[:limit]
 
     @app.get("/api/monitoring")
     def monitoring_queue(request: Request, due_only: bool = True) -> list[dict[str, Any]]:
@@ -568,13 +631,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/evolution/run")
     def evolve(request: Request) -> dict[str, Any]:
         current = require(request, {"admin"})
-        engine = EvolutionEngine()
-        report = engine.evolve(
-            store.get_calibration(), store.labeled_examples(), store.get_policy_profile()
-        )
-        if report.accepted:
-            store.save_calibration(report.calibration)
-            store.save_policy_profile(report.policy_profile)
+        report = harness.evolve_now(actor=current["id"])
         store.record_event(
             "learning_run",
             actor=current["id"],
@@ -585,8 +642,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/post-training/export", response_class=PlainTextResponse)
     def export_post_training(request: Request) -> str:
         require(request, {"admin"})
-        cases = [store.get_case(item["id"]) for item in store.list_cases(status="all")]
-        return PostTrainingCorpusBuilder().build_jsonl(cases, store.review_rows())
+        return PostTrainingCorpusBuilder().build_jsonl_from_store(store)
 
     @app.post("/api/demo")
     def demo(request: Request) -> dict[str, Any]:

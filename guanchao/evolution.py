@@ -12,6 +12,14 @@ from .domain import FeatureVector
 from .policy import PolicyProfile
 
 
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
 @dataclass(slots=True)
 class LabeledExample:
     features: FeatureVector
@@ -56,7 +64,7 @@ class EvolutionEngine:
         counts = {label: sum(item.label == label for item in examples) for label in (0, 1)}
         if min(counts.values(), default=0) < 2:
             return self._reject(current, policy, examples, "复核样本尚不足以形成双类交叉回放")
-        max_folds = max(2, int(os.getenv("GUANCHAO_EVOLUTION_MAX_FOLDS", "5")))
+        max_folds = _env_int("GUANCHAO_EVOLUTION_MAX_FOLDS", 5, 2, 20)
         k = max(2, min(max_folds, min(counts.values()), int(math.sqrt(len(examples))) or 2))
         folds = self._folds(examples, k)
         baselines: list[float] = []
@@ -113,15 +121,35 @@ class EvolutionEngine:
 
     @staticmethod
     def _folds(examples: list[LabeledExample], k: int) -> list[list[LabeledExample]]:
-        folds = [[] for _ in range(k)]
-        by_class: dict[int, list[tuple[str, LabeledExample]]] = {0: [], 1: []}
-        for item in examples:
-            fingerprint = item.group or "|".join(f"{value:.6f}" for value in item.features.asdict().values())
-            digest = hashlib.sha256(f"{item.label}|{fingerprint}".encode()).hexdigest()
-            by_class.setdefault(item.label, []).append((digest, item))
+        """Build deterministic folds without ever splitting a declared group."""
+        folds: list[list[LabeledExample]] = [[] for _ in range(k)]
+        grouped: dict[str, list[LabeledExample]] = {}
+        for index, item in enumerate(examples):
+            feature_key = "|".join(
+                f"{value:.6f}" for value in item.features.asdict().values()
+            )
+            key = item.group or f"__row__:{index}:{item.label}:{feature_key}"
+            grouped.setdefault(key, []).append(item)
+
+        by_class: dict[int, list[tuple[str, list[LabeledExample]]]] = {0: [], 1: []}
+        for group, rows in grouped.items():
+            label_counts = {
+                label: sum(item.label == label for item in rows)
+                for label in (0, 1)
+            }
+            balance_label = 1 if label_counts[1] > label_counts[0] else 0
+            payload = group + "|" + "|".join(
+                f"{item.label}:" + ",".join(
+                    f"{value:.6f}" for value in item.features.asdict().values()
+                )
+                for item in rows
+            )
+            digest = hashlib.sha256(payload.encode()).hexdigest()
+            by_class.setdefault(balance_label, []).append((digest, rows))
+
         for label in sorted(by_class):
-            for index, (_, item) in enumerate(sorted(by_class[label], key=lambda row: row[0])):
-                folds[index % k].append(item)
+            for index, (_, rows) in enumerate(sorted(by_class[label], key=lambda row: row[0])):
+                folds[index % k].extend(rows)
         return folds
 
     def _fit(self, current: Calibration, examples: list[LabeledExample]) -> Calibration:
@@ -206,6 +234,26 @@ class EvolutionEngine:
             if score > best_selective:
                 best_selective = score
                 best_margin = margin
+
+        upper_abstain = min(1.0, best_threshold + best_margin)
+        strong_positive = [
+            probability
+            for probability, label in zip(probabilities, labels)
+            if label == 1 and probability > upper_abstain
+        ]
+        if strong_positive:
+            high_threshold = statistics.median(strong_positive)
+        elif candidate.high_threshold > upper_abstain:
+            high_threshold = candidate.high_threshold
+        else:
+            # No observed positive example supports a separate high-confidence
+            # label yet. Put the high threshold at the top of the probability
+            # range instead of collapsing it onto the abstain edge. This keeps
+            # ordinary positive scores representable as "明显营销倾向" and makes
+            # "高度营销化" conservative until evidence actually supports it.
+            high_threshold = 1.0
+        high_threshold = min(1.0, max(upper_abstain, high_threshold))
+
         return Calibration(
             bias=candidate.bias,
             weights=dict(candidate.weights),
@@ -214,7 +262,7 @@ class EvolutionEngine:
             semantic_weight=candidate.semantic_weight,
             decision_threshold=best_threshold,
             abstain_margin=best_margin,
-            high_threshold=min(1.0, best_threshold + best_margin),
+            high_threshold=high_threshold,
         )
 
     def _metric(self, calibration: Calibration, examples: list[LabeledExample]) -> float:
@@ -269,6 +317,14 @@ class EvolutionEngine:
         if not candidates:
             return fallback
         median = statistics.median
+        decision_threshold = median([candidate.decision_threshold for candidate in candidates])
+        abstain_margin = median([candidate.abstain_margin for candidate in candidates])
+        maximum_band = max(0.0, min(decision_threshold, 1.0 - decision_threshold))
+        upper_abstain = min(1.0, decision_threshold + min(maximum_band, abstain_margin))
+        high_threshold = max(
+            upper_abstain,
+            median([candidate.high_threshold for candidate in candidates]),
+        )
         return Calibration(
             bias=median([candidate.bias for candidate in candidates]),
             weights={
@@ -281,9 +337,9 @@ class EvolutionEngine:
             },
             temperature=median([candidate.temperature for candidate in candidates]),
             semantic_weight=fallback.semantic_weight,
-            decision_threshold=median([candidate.decision_threshold for candidate in candidates]),
-            abstain_margin=median([candidate.abstain_margin for candidate in candidates]),
-            high_threshold=median([candidate.high_threshold for candidate in candidates]),
+            decision_threshold=decision_threshold,
+            abstain_margin=abstain_margin,
+            high_threshold=min(1.0, high_threshold),
         )
 
     @staticmethod

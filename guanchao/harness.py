@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import sqlite3
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from typing import Any
 
-from .detection import MarketingDetector
-from .domain import RunEvent
-from .evolution import EvolutionEngine
+from .detection import Calibration, MarketingDetector
+from .domain import FeatureVector, RunEvent
+from .evolution import EvolutionEngine, EvolutionReport, LabeledExample
 from .policy import OwnedPolicy
+from .run_lease import (
+    is_global_capacity_error,
+    observe_running_case,
+    prepare_run_start,
+)
+from .run_lock import run_claim
 from .semantic import SemanticEvidenceGateway
 from .store import Store
 from .tools import ToolRegistry
 from .verifier import ResultVerifier
+
+_LEARNING_CLAIM = "__guanchao_learning_state__"
+_CALIBRATION_PROVENANCE_KEY = "review_calibration_provenance"
 
 
 class ActiveRunError(RuntimeError):
@@ -22,6 +34,22 @@ class ActiveRunError(RuntimeError):
 
 class RunCapacityError(RuntimeError):
     pass
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+def _produced_marketing(label: str) -> bool | None:
+    if label in {"明显营销倾向", "高度营销化"}:
+        return True
+    if label == "更像普通创作者":
+        return False
+    return None
 
 
 class AgentHarness:
@@ -33,49 +61,73 @@ class AgentHarness:
         self._learning_guard = threading.RLock()
         self._futures: dict[str, Future] = {}
         self._active_cases: dict[str, str] = {}
-        max_workers = max(2, int(os.getenv("GUANCHAO_MAX_WORKERS", "8")))
-        self._max_inflight = max(max_workers, int(os.getenv("GUANCHAO_MAX_INFLIGHT", "256")))
+        self._closed = False
+        max_workers = _env_int("GUANCHAO_MAX_WORKERS", 8, 2, 128)
+        configured_inflight = _env_int("GUANCHAO_MAX_INFLIGHT", 256, 1, 100_000)
+        self._max_inflight = max(max_workers, configured_inflight)
         self._capacity = threading.BoundedSemaphore(self._max_inflight)
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="guanchao")
         self._learning_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guanchao-learning")
         self._learning_future: Future | None = None
 
+    def close(self) -> None:
+        with self._guard:
+            if self._closed:
+                return
+            self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        self._learning_executor.shutdown(wait=True, cancel_futures=False)
+
     def start(self, case_id: str, message: str, actor: str = "local") -> str:
+        self._ensure_open()
         self._reserve(1)
+        run_id: str | None = None
         try:
             with self._guard:
+                self._ensure_open()
+                prepare_run_start(self.store.path)
                 run_id = self._prepare_run(case_id, message, actor)
+                self._confirm_run_lease(case_id, run_id)
                 self._submit(run_id)
                 return run_id
         except Exception:
+            if run_id is not None:
+                with self._guard:
+                    self._fail_unsubmitted_run(case_id, run_id, "核查未启动")
             self._capacity.release()
             raise
 
     def start_many(self, case_ids: list[str], message: str, actor: str = "local") -> list[dict[str, str]]:
         if not case_ids:
             return []
+        self._ensure_open()
         self._reserve(len(case_ids))
         prepared: list[tuple[str, str]] = []
+        submitted = 0
         try:
             with self._guard:
+                self._ensure_open()
+                prepare_run_start(self.store.path)
                 for case_id in case_ids:
-                    prepared.append((case_id, self._prepare_run(case_id, message, actor)))
+                    run_id = self._prepare_run(case_id, message, actor)
+                    prepared.append((case_id, run_id))
+                    self._confirm_run_lease(case_id, run_id)
                 for _, run_id in prepared:
                     self._submit(run_id)
+                    submitted += 1
         except Exception:
             with self._guard:
-                for case_id, run_id in prepared:
-                    run = self.store.get_run(run_id)
-                    state = run["state"]
-                    state["events"].append(
-                        RunEvent.create("error", "批量核查未启动", "批量任务准备过程中断，可以重新发起。", status="error").asdict()
-                    )
-                    self.store.update_run(run_id, state, "failed")
-                    self._active_cases.pop(case_id, None)
-            for _ in case_ids:
+                for case_id, run_id in prepared[submitted:]:
+                    self._fail_unsubmitted_run(case_id, run_id, "批量核查未启动")
+            for _ in range(len(case_ids) - submitted):
                 self._capacity.release()
             raise
         return [{"case_id": case_id, "run_id": run_id} for case_id, run_id in prepared]
+
+    def _ensure_open(self) -> None:
+        with self._guard:
+            if self._closed:
+                raise RunCapacityError("harness is closed")
 
     def _reserve(self, count: int) -> None:
         acquired = 0
@@ -86,39 +138,91 @@ class AgentHarness:
                 raise RunCapacityError(f"inflight capacity {self._max_inflight} reached")
             acquired += 1
 
+    def _confirm_run_lease(self, case_id: str, run_id: str) -> None:
+        if self.store.path == ":memory:":
+            return
+        adopted = observe_running_case(self.store.path, case_id)
+        if adopted != run_id:
+            raise RuntimeError(f"durable run lease was not acquired for {run_id}")
+
     def _prepare_run(self, case_id: str, message: str, actor: str) -> str:
-        case = self.store.get_case(case_id)
-        existing = self._active_cases.get(case_id)
-        if existing:
-            run = self.store.get_run(existing)
-            if run["status"] == "running":
-                raise ActiveRunError(existing)
-            self._active_cases.pop(case_id, None)
-        db_active = self.store.active_run_for_case(case_id)
-        if db_active:
-            raise ActiveRunError(db_active["id"])
-        self.store.add_message(case_id, "user", message)
-        assets = self.store.list_assets(case_id, include_text=True)
-        state: dict[str, Any] = {
-            "goal": message or case["goal"],
-            "targets": case["targets"],
-            "assets": assets,
-            "sample_size": len(case["targets"][0].get("posts") or []) if case["targets"] else 0,
-            "completed_tools": [],
-            "events": [RunEvent.create("plan", "开始核查", "正在判断哪些证据最值得先看。", status="working").asdict()],
-            "evidence": [],
-            "tool_outputs": {},
-            "primary_result": {},
-            "answer": None,
-            "decision_count": 0,
-            "trajectory": [],
-        }
-        run = self.store.create_run(case_id, state, actor=actor)
-        self._active_cases[case_id] = run["id"]
-        return run["id"]
+        with run_claim(self.store.path, case_id):
+            case = self.store.get_case(case_id)
+            existing = self._active_cases.get(case_id)
+            if existing:
+                run = self.store.get_run(existing)
+                if run["status"] == "running":
+                    raise ActiveRunError(existing)
+                if self._active_cases.get(case_id) == existing:
+                    self._active_cases.pop(case_id, None)
+            db_active = self.store.active_run_for_case(case_id)
+            if db_active:
+                raise ActiveRunError(db_active["id"])
+            assets = self.store.list_assets(case_id, include_text=True)
+            state: dict[str, Any] = {
+                "goal": message or case["goal"],
+                "targets": case["targets"],
+                "assets": assets,
+                "sample_size": len(case["targets"][0].get("posts") or []) if case["targets"] else 0,
+                "completed_tools": [],
+                "events": [RunEvent.create("plan", "开始核查", "正在判断哪些证据最值得先看。", status="working").asdict()],
+                "evidence": [],
+                "tool_outputs": {},
+                "primary_result": {},
+                "answer": None,
+                "decision_count": 0,
+                "trajectory": [],
+            }
+            try:
+                run = self.store.create_run(
+                    case_id,
+                    state,
+                    actor=actor,
+                    user_message=message,
+                )
+            except sqlite3.IntegrityError as exc:
+                active = self.store.active_run_for_case(case_id)
+                if active:
+                    raise ActiveRunError(active["id"]) from None
+                if is_global_capacity_error(exc):
+                    raise RunCapacityError(
+                        f"inflight capacity {self._max_inflight} reached"
+                    ) from None
+                raise
+            self._active_cases[case_id] = run["id"]
+            return run["id"]
 
     def _submit(self, run_id: str) -> None:
-        self._futures[run_id] = self._executor.submit(self._execute, run_id)
+        future = self._executor.submit(self._execute, run_id)
+        with self._guard:
+            self._futures[run_id] = future
+        future.add_done_callback(lambda done, rid=run_id: self._forget_future(rid, done))
+
+    def _forget_future(self, run_id: str, future: Future) -> None:
+        with self._guard:
+            if self._futures.get(run_id) is future:
+                self._futures.pop(run_id, None)
+
+    def _fail_unsubmitted_run(self, case_id: str, run_id: str, title: str) -> None:
+        try:
+            run = self.store.get_run(run_id)
+        except KeyError:
+            if self._active_cases.get(case_id) == run_id:
+                self._active_cases.pop(case_id, None)
+            return
+        if run["status"] == "running":
+            state = run["state"]
+            state.setdefault("events", []).append(
+                RunEvent.create(
+                    "error",
+                    title,
+                    "任务没有进入执行器，已安全结束本次记录，可以重新发起。",
+                    status="error",
+                ).asdict()
+            )
+            self.store.update_run(run_id, state, "failed")
+        if self._active_cases.get(case_id) == run_id:
+            self._active_cases.pop(case_id, None)
 
     def execute_inline(self, case_id: str, message: str, actor: str = "local") -> dict[str, Any]:
         run_id = self.start(case_id, message, actor=actor)
@@ -147,19 +251,42 @@ class AgentHarness:
 
     def observe_review(self, run_id: str, decision: str, actor: str = "local") -> None:
         with self._learning_guard:
+            if self._closed:
+                return
             previous = self._learning_future
-            self._learning_future = self._learning_executor.submit(
-                self._apply_review_learning, run_id, decision, actor, previous
-            )
+            try:
+                future = self._learning_executor.submit(
+                    self._apply_review_learning, run_id, decision, actor, previous
+                )
+            except RuntimeError:
+                return
+            self._learning_future = future
+
+    def evolve_now(self, actor: str = "local") -> EvolutionReport:
+        with self._learning_guard:
+            if self._closed:
+                raise RuntimeError("harness is closed")
+            previous = self._learning_future
+            future = self._learning_executor.submit(self._apply_manual_evolution, actor, previous)
+            self._learning_future = future
+        return future.result()
 
     def _execute(self, run_id: str) -> None:
-        run = self.store.get_run(run_id)
-        state = run["state"]
-        case_id = run["case_id"]
-        detector = MarketingDetector(self.store.get_calibration(), self.semantic_gateway)
-        policy = OwnedPolicy(self.store.get_policy_profile())
-        registry = ToolRegistry(detector)
+        case_id: str | None = None
+        state: dict[str, Any] | None = None
+        completed = False
         try:
+            run = self.store.get_run(run_id)
+            state = run["state"]
+            case_id = run["case_id"]
+            calibration = self.store.get_calibration()
+            detector = MarketingDetector(calibration, self.semantic_gateway)
+            policy = OwnedPolicy(
+                self.store.get_policy_profile(),
+                decision_threshold=calibration.decision_threshold,
+            )
+            registry = ToolRegistry(detector)
+
             for _ in range(len(registry.names()) + 1):
                 decision = policy.decide(state["goal"], state)
                 if decision is None:
@@ -180,15 +307,18 @@ class AgentHarness:
                     self.store.update_run(run_id, state, "failed")
                     return
                 state["completed_tools"].append(decision.tool)
-                state["tool_outputs"][decision.tool] = result.asdict()
-                self._merge_evidence(state, result.asdict()["evidence"])
+                serialized = result.asdict()
+                state["tool_outputs"][decision.tool] = serialized
+                self._merge_evidence(state, serialized["evidence"])
                 state["events"].append(
                     RunEvent.create("tool", self._customer_title(decision.tool), result.summary, decision.tool, "done").asdict()
                 )
                 if decision.tool == "content.scan":
                     state["primary_result"] = result.payload
                 if decision.tool == "stability.probe" and state.get("primary_result"):
-                    state["primary_result"]["stability"] = result.payload.get("stability", state["primary_result"].get("stability"))
+                    state["primary_result"]["stability"] = result.payload.get(
+                        "stability", state["primary_result"].get("stability")
+                    )
                 if decision.tool == "verdict.compose":
                     state["primary_result"] = result.payload
                     state["answer"] = result.payload["summary"]
@@ -211,6 +341,7 @@ class AgentHarness:
                         }
                     )
                 self.store.update_run(run_id, state, "running")
+
             if not state.get("answer"):
                 state["answer"] = "当前资料还不足以形成稳定判断，请补充更多近期内容或可核对素材。"
                 self.store.add_message(case_id, "assistant", state["answer"])
@@ -218,18 +349,43 @@ class AgentHarness:
                 RunEvent.create("complete", "核查完成", "判断、证据和待补资料已经整理好。", status="done").asdict()
             )
             self.store.update_run(run_id, state, "completed")
+            completed = True
+
             if state.get("trajectory"):
-                self._schedule_trajectory_learning(run_id, state["trajectory"])
+                try:
+                    self._schedule_trajectory_learning(run_id, state["trajectory"])
+                except Exception as exc:
+                    try:
+                        self.store.record_event(
+                            "harness_learning_schedule_failed",
+                            run_id=run_id,
+                            metadata={"error": type(exc).__name__},
+                        )
+                    except Exception:
+                        pass
         except Exception as exc:
-            state["internal_error"] = type(exc).__name__
-            state["events"].append(
-                RunEvent.create("error", "执行未完成", "本次核查中断，已保留已有记录，可以重新发起。", status="error").asdict()
-            )
-            self.store.update_run(run_id, state, "failed")
+            if state is not None and not completed:
+                state["internal_error"] = type(exc).__name__
+                state.setdefault("events", []).append(
+                    RunEvent.create(
+                        "error",
+                        "执行未完成",
+                        "本次核查中断，已保留已有记录，可以重新发起。",
+                        status="error",
+                    ).asdict()
+                )
+                try:
+                    self.store.update_run(run_id, state, "failed")
+                except Exception:
+                    pass
         finally:
             with self._guard:
-                self._futures.pop(run_id, None)
-                self._active_cases.pop(case_id, None)
+                if case_id is not None and self._active_cases.get(case_id) == run_id:
+                    self._active_cases.pop(case_id, None)
+                elif case_id is None:
+                    for active_case, active_run in list(self._active_cases.items()):
+                        if active_run == run_id:
+                            self._active_cases.pop(active_case, None)
             self._capacity.release()
 
     def _schedule_trajectory_learning(self, run_id: str, trajectory: list[dict[str, Any]]) -> None:
@@ -239,62 +395,273 @@ class AgentHarness:
                 self._apply_trajectory_learning, run_id, list(trajectory), previous
             )
 
-    def _apply_trajectory_learning(self, run_id: str, trajectory: list[dict[str, Any]], previous: Future | None = None) -> None:
-        if previous is not None:
-            try:
-                previous.result()
-            except Exception:
-                pass
-        profile = self.store.get_policy_profile()
-        profile.observe(trajectory)
-        self.store.save_policy_profile(profile)
-        self.store.record_event(
-            "harness_experience_replayed",
-            run_id=run_id,
-            metadata={"steps": len(trajectory), "policy_steps": profile.steps},
-        )
+    def _apply_trajectory_learning(
+        self,
+        run_id: str,
+        trajectory: list[dict[str, Any]],
+        previous: Future | None = None,
+    ) -> None:
+        self._await_previous(previous)
+        with run_claim(self.store.path, _LEARNING_CLAIM):
+            profile = self.store.get_policy_profile()
+            profile.observe(trajectory)
+            self.store.save_policy_profile(profile)
+            self.store.record_event(
+                "harness_experience_replayed",
+                run_id=run_id,
+                metadata={"steps": len(trajectory), "policy_steps": profile.steps},
+            )
 
-    def _apply_review_learning(self, run_id: str, decision: str, actor: str, previous: Future | None = None) -> None:
-        if previous is not None:
-            try:
-                previous.result()
-            except Exception:
-                pass
-        if decision == "uncertain":
+    @staticmethod
+    def _await_previous(previous: Future | None) -> None:
+        if previous is None:
             return
-        run = self.store.get_run(run_id)
-        state = run.get("state") or {}
-        trajectory = list(state.get("trajectory") or [])
-        result = state.get("primary_result") or {}
-        calibration = self.store.get_calibration()
-        predicted = float(result.get("marketing_likelihood") or 0.0) >= calibration.decision_threshold
-        human = decision == "confirm_marketing"
-        profile = self.store.get_policy_profile()
-        profile.observe_review(trajectory, predicted == human)
-        self.store.save_policy_profile(profile)
-        report = EvolutionEngine().evolve(calibration, self.store.labeled_examples(), profile)
+        try:
+            previous.result()
+        except Exception:
+            pass
+
+    def _apply_review_learning(
+        self,
+        run_id: str,
+        decision: str,
+        actor: str,
+        previous: Future | None = None,
+    ) -> None:
+        self._await_previous(previous)
+        with run_claim(self.store.path, _LEARNING_CLAIM):
+            stored_review = self.store.review_for_run(run_id)
+            if stored_review is None:
+                return
+            decision = str(stored_review.get("decision") or decision)
+            actor = str(stored_review.get("reviewer") or actor)
+
+            run = self.store.get_run(run_id)
+            state = run.get("state") or {}
+            result = state.get("primary_result") or {}
+            predicted = _produced_marketing(str(result.get("label") or ""))
+            review_correct: bool | None = None
+            if decision != "uncertain":
+                human = decision == "confirm_marketing"
+                review_correct = None if predicted is None else predicted == human
+
+            latest = self._latest_reviews_by_case()
+            profile = self.store.get_policy_profile()
+            profile_changed = self._sync_review_feedback(profile, latest)
+            examples = self.review_examples(latest)
+            fingerprint = self._review_dataset_fingerprint(examples)
+            dataset_changed = fingerprint != profile.review_dataset_fingerprint
+            calibration_promoted = False
+            calibration_reset = False
+            report_examples = len(examples)
+
+            if dataset_changed:
+                report, calibration_promoted, calibration_reset = self._fit_review_dataset(
+                    examples, profile, fingerprint
+                )
+                report_examples = report.examples
+                profile.review_dataset_fingerprint = fingerprint
+
+            if profile_changed or dataset_changed:
+                self.store.save_policy_profile(profile)
+
+            if not profile_changed and not dataset_changed:
+                self.store.record_event(
+                    "harness_review_feedback_noop",
+                    actor=actor,
+                    run_id=run_id,
+                    metadata={"decision": decision},
+                )
+                return
+
+            self.store.record_event(
+                "harness_self_evolved",
+                actor=actor,
+                run_id=run_id,
+                metadata={
+                    "review_correct": review_correct,
+                    "calibration_promoted": calibration_promoted,
+                    "calibration_reset": calibration_reset,
+                    "examples": report_examples,
+                    "policy_steps": profile.steps,
+                    "review_feedback": len(profile.review_feedback),
+                },
+            )
+
+    def _apply_manual_evolution(
+        self,
+        actor: str,
+        previous: Future | None = None,
+    ) -> EvolutionReport:
+        self._await_previous(previous)
+        with run_claim(self.store.path, _LEARNING_CLAIM):
+            latest = self._latest_reviews_by_case()
+            profile = self.store.get_policy_profile()
+            self._sync_review_feedback(profile, latest)
+            examples = self.review_examples(latest)
+            fingerprint = self._review_dataset_fingerprint(examples)
+            report, _, _ = self._fit_review_dataset(examples, profile, fingerprint)
+            profile.review_dataset_fingerprint = fingerprint
+            self.store.save_policy_profile(profile)
+            return report
+
+    def _fit_review_dataset(
+        self,
+        examples: list[LabeledExample],
+        profile: Any,
+        fingerprint: str,
+    ) -> tuple[EvolutionReport, bool, bool]:
+        current = self.store.get_calibration()
+        provenance = self.store._setting(_CALIBRATION_PROVENANCE_KEY) or {}
+        base = current
+        managed = False
+        if isinstance(provenance, dict):
+            raw_base = provenance.get("base")
+            raw_applied = provenance.get("applied")
+            if isinstance(raw_base, dict) and isinstance(raw_applied, dict):
+                applied = Calibration.from_dict(raw_applied)
+                if current == applied:
+                    base = Calibration.from_dict(raw_base)
+                    managed = True
+
+        report = EvolutionEngine().evolve(base, examples, profile)
         if report.accepted:
             self.store.save_calibration(report.calibration)
-        self.store.record_event(
-            "harness_self_evolved",
-            actor=actor,
-            run_id=run_id,
-            metadata={
-                "review_correct": predicted == human,
-                "calibration_promoted": report.accepted,
-                "examples": report.examples,
-                "policy_steps": profile.steps,
-            },
+            self.store._save_setting(
+                _CALIBRATION_PROVENANCE_KEY,
+                {
+                    "base": base.to_dict(),
+                    "applied": report.calibration.to_dict(),
+                    "dataset_fingerprint": fingerprint,
+                },
+            )
+            return report, True, False
+
+        reset = managed and current != base
+        if reset:
+            self.store.save_calibration(base)
+        self.store._save_setting(_CALIBRATION_PROVENANCE_KEY, {})
+        return report, False, reset
+
+    def _latest_reviews_by_case(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(row.get("case_id")): row
+            for row in self.store.latest_review_snapshots()
+            if row.get("case_id")
+        }
+
+    def _sync_review_feedback(
+        self,
+        profile: Any,
+        latest: dict[str, dict[str, Any]] | None = None,
+    ) -> bool:
+        desired: dict[str, dict[str, Any]] = {}
+        latest = latest if latest is not None else self._latest_reviews_by_case()
+        for case_id, row in latest.items():
+            decision = str(row.get("decision") or "")
+            if decision == "uncertain":
+                continue
+            state = row.get("run_state") or {}
+            if not isinstance(state, dict):
+                continue
+            trajectory = list(state.get("trajectory") or [])
+            verdicts = [
+                item
+                for item in trajectory
+                if isinstance(item, dict) and item.get("action") == "verdict.compose"
+            ]
+            if not verdicts:
+                continue
+            raw_features = verdicts[-1].get("features") or []
+            if not isinstance(raw_features, list) or len(raw_features) != 11:
+                continue
+            try:
+                features = [float(value) for value in raw_features]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if any(not (float("-inf") < value < float("inf")) for value in features):
+                continue
+            predicted = _produced_marketing(
+                str((state.get("primary_result") or {}).get("label") or "")
+            )
+            human = decision == "confirm_marketing"
+            reward = 0.0 if predicted is None else 1.0 if predicted == human else -1.0
+            desired[case_id] = {"features": features, "reward": reward}
+
+        changed = profile.review_feedback != desired or profile.reviews != len(desired)
+        if changed:
+            profile.review_feedback = desired
+            profile.reviews = len(desired)
+        return changed
+
+    def review_examples(
+        self,
+        latest: dict[str, dict[str, Any]] | None = None,
+    ) -> list[LabeledExample]:
+        examples: list[LabeledExample] = []
+        latest = latest if latest is not None else self._latest_reviews_by_case()
+        for case_id, row in latest.items():
+            decision = str(row.get("decision") or "")
+            if decision == "uncertain":
+                continue
+            state = row.get("run_state") or {}
+            if not isinstance(state, dict):
+                continue
+            features = (state.get("primary_result") or {}).get("features")
+            if not isinstance(features, dict):
+                continue
+            try:
+                vector = FeatureVector(**features)
+            except (TypeError, ValueError):
+                continue
+            examples.append(
+                LabeledExample(
+                    vector,
+                    1 if decision == "confirm_marketing" else 0,
+                    case_id,
+                )
+            )
+        examples.sort(key=lambda item: item.group)
+        return examples
+
+    @staticmethod
+    def _review_dataset_fingerprint(examples: list[Any]) -> str:
+        rows = [
+            {
+                "group": str(item.group),
+                "label": int(item.label),
+                "features": item.features.asdict(),
+            }
+            for item in examples
+        ]
+        rows.sort(
+            key=lambda row: (
+                row["group"],
+                row["label"],
+                json.dumps(row["features"], sort_keys=True, separators=(",", ":")),
+            )
         )
+        payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _merge_evidence(state: dict[str, Any], items: list[dict[str, Any]]) -> None:
         seen = {
-            (evidence.get("key"), evidence.get("direction"), tuple(evidence.get("post_ids") or []), tuple(evidence.get("asset_ids") or []))
+            (
+                evidence.get("key"),
+                evidence.get("direction"),
+                tuple(evidence.get("post_ids") or []),
+                tuple(evidence.get("asset_ids") or []),
+            )
             for evidence in state.get("evidence") or []
         }
         for item in items:
-            key = (item.get("key"), item.get("direction"), tuple(item.get("post_ids") or []), tuple(item.get("asset_ids") or []))
+            key = (
+                item.get("key"),
+                item.get("direction"),
+                tuple(item.get("post_ids") or []),
+                tuple(item.get("asset_ids") or []),
+            )
             if key not in seen:
                 state["evidence"].append(item)
                 seen.add(key)

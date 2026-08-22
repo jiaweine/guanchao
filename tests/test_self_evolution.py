@@ -162,3 +162,92 @@ def test_review_api_triggers_harness_delayed_feedback(tmp_path):
         item["event_type"] == "harness_self_evolved"
         for item in app.state.store.audit_events(limit=100)
     )
+
+
+def test_policy_review_feedback_is_overwriteable_and_reversible():
+    profile = PolicyProfile()
+    trajectory = [
+        {
+            "action": "verdict.compose",
+            "features": [1.0] * 11,
+            "alternative": "evidence.challenge",
+            "alternative_features": [0.5] * 11,
+        }
+    ]
+
+    assert profile.observe_review("run-1", trajectory, True)
+    assert profile.reviews == 1
+    assert profile.review_feedback["run-1"]["reward"] == 1.0
+
+    assert not profile.observe_review("run-1", trajectory, True)
+    assert profile.reviews == 1
+
+    assert profile.observe_review("run-1", trajectory, False)
+    assert profile.reviews == 1
+    assert profile.review_feedback["run-1"]["reward"] == -1.0
+
+    assert profile.clear_review("run-1")
+    assert profile.reviews == 0
+    assert "run-1" not in profile.review_feedback
+
+
+def test_duplicate_review_retry_is_learning_noop_and_uncertain_withdraws_feedback(tmp_path):
+    app = create_app(str(tmp_path / "review-idempotency.sqlite"))
+    client = TestClient(app)
+    case = client.post(
+        "/api/cases",
+        json={
+            "title": "复核幂等",
+            "goal": "调查营销倾向并给出证据",
+            "targets": [_account("review-idempotency")],
+        },
+    ).json()
+    run_id = client.post(
+        f"/api/cases/{case['id']}/messages",
+        json={"content": case["goal"]},
+    ).json()["run_id"]
+    run = _wait_api_run(client, run_id)
+    app.state.harness.wait_learning(10)
+
+    score = float(run["state"]["primary_result"]["marketing_likelihood"])
+    threshold = app.state.store.get_calibration().decision_threshold
+    decisive = "confirm_marketing" if score >= threshold else "confirm_ordinary"
+    payload = {
+        "case_id": case["id"],
+        "run_id": run_id,
+        "decision": decisive,
+        "reason": "第一次人工确认",
+    }
+
+    assert client.post("/api/reviews", json=payload).status_code == 200
+    app.state.harness.wait_learning(10)
+    first = app.state.store.get_policy_profile()
+    assert case["id"] in first.review_feedback
+    first_reviews = first.reviews
+    first_fingerprint = first.review_dataset_fingerprint
+
+    assert client.post("/api/reviews", json=payload).status_code == 200
+    app.state.harness.wait_learning(10)
+    duplicate = app.state.store.get_policy_profile()
+    assert duplicate.reviews == first_reviews
+    assert duplicate.review_feedback == first.review_feedback
+    assert duplicate.review_dataset_fingerprint == first_fingerprint
+    assert any(
+        item["event_type"] == "harness_review_feedback_noop" and item["run_id"] == run_id
+        for item in app.state.store.audit_events(limit=100)
+    )
+
+    assert client.post(
+        "/api/reviews",
+        json={
+            "case_id": case["id"],
+            "run_id": run_id,
+            "decision": "uncertain",
+            "reason": "撤回复核标签",
+        },
+    ).status_code == 200
+    app.state.harness.wait_learning(10)
+    withdrawn = app.state.store.get_policy_profile()
+    assert case["id"] not in withdrawn.review_feedback
+    assert withdrawn.reviews == max(0, first_reviews - 1)
+    assert app.state.harness.review_examples() == []
